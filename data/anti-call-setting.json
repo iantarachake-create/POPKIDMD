@@ -1,0 +1,7 @@
+{
+  "rejectCalls": true,
+  "blockCaller": false,
+  "notifyAdmin": true,
+  "autoReply": "🚫 I don't accept calls. Please send a text message instead.",
+  "blockedUsers": []
+}
