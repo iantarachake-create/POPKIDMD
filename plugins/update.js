@@ -10,8 +10,8 @@ const { cmd } = require('../arslan');
 // GITHUB CONFIG
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-const repoOwner = 'popkidultra';
-const repoName = 'POPKID-BOT';
+const repoOwner = 'iantarachake-create';
+const repoName = 'POPKIDMD';
 const branch = 'main';
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
