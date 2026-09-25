@@ -1,0 +1,13 @@
+node_modules/
+npm-debug.log*
+
+# WhatsApp auth state — regenerated at boot from the SESSION_ID env var.
+# Never commit real creds.json / keys here.
+session/*
+!session/.gitkeep
+
+.env
+.env.*
+
+*.log
+.DS_Store
