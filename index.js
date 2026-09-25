@@ -13,10 +13,11 @@ const { decodeSessionId } = require('./lib/sessionLoader');
 const { AntideleteHandler } = require('./lib/antidelete');
 const { handleChatbotResponse } = require('./lib/chatbot');
 const { handleLinkDetection } = require('./lib/antilink');
-const JimpImport = require('jimp');
 const AdmZip = require('adm-zip');
 
-// Optional dependency — sticker maker degrades gracefully if not installed.
+// Optional dependencies — degrade gracefully instead of crashing the whole
+// process (and taking the HTTP port down with it) if a native build failed
+// on a memory-constrained host.
 let sharp;
 try {
     sharp = require('sharp');
@@ -24,12 +25,18 @@ try {
     sharp = null;
 }
 
-const Jimp =
-  JimpImport.read
-    ? JimpImport
-    : JimpImport.Jimp
-    ? JimpImport.Jimp
-    : JimpImport.default;
+let Jimp = null;
+try {
+    const JimpImport = require('jimp');
+    Jimp =
+      JimpImport.read
+        ? JimpImport
+        : JimpImport.Jimp
+        ? JimpImport.Jimp
+        : JimpImport.default;
+} catch {
+    Jimp = null;
+}
 
 global.generateWAMessageContent = generateWAMessageContent;
 global.generateWAMessageFromContent = generateWAMessageFromContent;
