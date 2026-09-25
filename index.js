@@ -4,6 +4,7 @@ const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const axios = require('axios');
 const QRCode = require('qrcode');
 const { Boom } = require('@hapi/boom');
 const { sendButtons, sendInteractiveMessage } = require('gifted-btns');
@@ -13,6 +14,15 @@ const { AntideleteHandler } = require('./lib/antidelete');
 const { handleChatbotResponse } = require('./lib/chatbot');
 const { handleLinkDetection } = require('./lib/antilink');
 const JimpImport = require('jimp');
+const AdmZip = require('adm-zip');
+
+// Optional dependency — sticker maker degrades gracefully if not installed.
+let sharp;
+try {
+    sharp = require('sharp');
+} catch {
+    sharp = null;
+}
 
 const Jimp =
   JimpImport.read
@@ -30,6 +40,22 @@ global.Jimp = Jimp;
 global.generateProfilePicture = generateProfilePicture;
 global.downloadMediaMessage = downloadMediaMessage;
 global.bannedChats = global.bannedChats || [];
+
+/* =========================================================
+ADVANCED FEATURE STATE (moderation / anti-spam / warn system)
+========================================================= */
+global.antiCall = global.antiCall ?? false;
+global.antiSpamEnabled = global.antiSpamEnabled ?? false;
+global.antiSpamLimit = global.antiSpamLimit ?? 5;        // messages
+global.antiSpamWindowMs = global.antiSpamWindowMs ?? 10000; // per 10s
+
+const spamTracker = new Map(); // jid -> [timestamps]
+const warnCounts = global.warnCounts instanceof Map ? global.warnCounts : new Map();
+global.warnCounts = warnCounts;
+const MAX_WARNINGS = 3;
+// Note: warnCounts is in-memory only — it resets whenever the bot process
+// restarts. Persist it to a file/DB yourself if you need it to survive restarts.
+
 if (!fs.existsSync(__dirname + '/session/creds.json') && global.sessionid) {
     const result = decodeSessionId(global.sessionid);
     if (result.ok) {
@@ -183,6 +209,238 @@ async function resolveStatusParticipant(sock, rawMsg) {
     // Nothing worked — return the raw @lid, same as before, so the caller
     // keeps its existing "best effort" behavior instead of crashing.
     return rawParticipant;
+}
+// -----------------------------------------------------------------------
+
+/* =========================================================
+ADVANCED FEATURES — MODERATION / MEDIA / ADMIN TOOLS
+========================================================= */
+
+// --- Toggle helper for owner-only on/off commands (.anticall, .antispam) ---
+async function handleToggle(m, args, stateKey, label) {
+    if (!(m.isOwner || m.isDev)) {
+        return m.reply('❌ Owner only.');
+    }
+    const value = (args[0] || '').toLowerCase();
+    if (value !== 'on' && value !== 'off') {
+        return m.reply(`❌ Usage: ${global.BOT_PREFIX}${label.toLowerCase().replace(/\s+/g, '')} on|off`);
+    }
+    global[stateKey] = value === 'on';
+    return m.reply(`✅ ${label} turned ${value.toUpperCase()}.`);
+}
+
+// --- Warn system: .warn (reply or @mention) [reason] ---
+async function handleWarn(sock, m, rawMsg, args) {
+    if (!(m.isAdmin || m.isOwner || m.isDev)) {
+        return m.reply('❌ Admins only.');
+    }
+
+    const mentioned = rawMsg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    const quotedParticipant = rawMsg.message?.extendedTextMessage?.contextInfo?.participant;
+    const target = mentioned || quotedParticipant;
+
+    if (!target) {
+        return m.reply('❌ Tag or reply to the user you want to warn.');
+    }
+
+    const reason = args.filter(a => !a.startsWith('@')).join(' ') || 'No reason given';
+    const count = (warnCounts.get(target) || 0) + 1;
+    warnCounts.set(target, count);
+
+    if (count >= MAX_WARNINGS) {
+        warnCounts.set(target, 0);
+        try {
+            await sock.groupParticipantsUpdate(m.from, [target], 'remove');
+            await sock.sendMessage(m.from, {
+                text: waBox('WARN SYSTEM', [
+                    `🚫 @${target.split('@')[0]} reached ${MAX_WARNINGS} warnings and was removed.`
+                ]),
+                mentions: [target]
+            });
+        } catch (err) {
+            await m.reply(`⚠️ Warning limit reached but I couldn't remove them (am I an admin?): ${err.message}`);
+        }
+    } else {
+        await sock.sendMessage(m.from, {
+            text: waBox('WARN SYSTEM', [
+                `⚠️ @${target.split('@')[0]} warned (${count}/${MAX_WARNINGS})`,
+                `📝 Reason: ${reason}`
+            ]),
+            mentions: [target]
+        });
+    }
+}
+
+// --- .resetwarn (reply or @mention) ---
+async function handleResetWarn(m, rawMsg) {
+    if (!(m.isAdmin || m.isOwner || m.isDev)) {
+        return m.reply('❌ Admins only.');
+    }
+    const target = rawMsg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]
+        || rawMsg.message?.extendedTextMessage?.contextInfo?.participant;
+    if (!target) {
+        return m.reply('❌ Tag or reply to a user.');
+    }
+    warnCounts.set(target, 0);
+    return m.reply('✅ Warnings reset.');
+}
+
+// --- Sticker maker: .sticker / .s (reply to an image, or caption an image) ---
+async function handleSticker(sock, m, rawMsg) {
+    if (!sharp) {
+        return m.reply('❌ Sticker maker needs the "sharp" package. Run: npm install sharp');
+    }
+
+    const ctx = rawMsg.message?.extendedTextMessage?.contextInfo;
+    const quoted = ctx?.quotedMessage;
+    let targetMsg;
+
+    if (quoted?.imageMessage) {
+        targetMsg = {
+            message: quoted,
+            key: {
+                remoteJid: m.from,
+                id: ctx.stanzaId,
+                fromMe: false,
+                participant: ctx.participant
+            }
+        };
+    } else if (rawMsg.message?.imageMessage) {
+        targetMsg = rawMsg;
+    } else {
+        return m.reply('❌ Reply to an image with .sticker (or send an image captioned .sticker).');
+    }
+
+    try {
+        const buffer = await downloadMediaMessage(targetMsg, 'buffer', {});
+        const webp = await sharp(buffer)
+            .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp()
+            .toBuffer();
+        await sock.sendMessage(m.from, { sticker: webp });
+    } catch (err) {
+        await m.reply(`❌ Sticker failed: ${err.message}`);
+    }
+}
+
+// --- Broadcast: .broadcast <message> (owner only) ---
+async function handleBroadcast(sock, m, args) {
+    const text = args.join(' ');
+    if (!text) {
+        return m.reply('❌ Usage: .broadcast <message>');
+    }
+    try {
+        const groups = await sock.groupFetchAllParticipating();
+        const ids = Object.keys(groups);
+        let sent = 0;
+        for (const gid of ids) {
+            try {
+                await sock.sendMessage(gid, { text: waBox('BROADCAST', [text]) });
+                sent++;
+                await new Promise(resolve => setTimeout(resolve, 1500)); // avoid WA rate limits
+            } catch {}
+        }
+        await m.reply(`✅ Broadcast sent to ${sent}/${ids.length} groups.`);
+    } catch (err) {
+        await m.reply(`❌ Broadcast failed: ${err.message}`);
+    }
+}
+
+// --- Session backup: .backup (owner only, DM recommended) ---
+async function handleBackup(sock, m) {
+    if (!fs.existsSync(AUTH_FOLDER)) {
+        return m.reply('❌ No session folder found to back up.');
+    }
+    try {
+        const zip = new AdmZip();
+        zip.addLocalFolder(AUTH_FOLDER);
+        const buffer = zip.toBuffer();
+        await sock.sendMessage(m.from, {
+            document: buffer,
+            fileName: `session-backup-${Date.now()}.zip`,
+            mimetype: 'application/zip',
+            caption: waBox('SESSION BACKUP', [
+                '🗄️ Keep this file safe.',
+                '⚠️ Anyone with it can access your WhatsApp session.'
+            ])
+        });
+    } catch (err) {
+        await m.reply(`❌ Backup failed: ${err.message}`);
+    }
+}
+
+// --- Session restore: reply to a .zip backup with .restore (owner only) ---
+async function handleRestore(sock, m, rawMsg) {
+    const ctx = rawMsg.message?.extendedTextMessage?.contextInfo;
+    const quoted = ctx?.quotedMessage;
+    const docMsg = quoted?.documentMessage;
+
+    if (!docMsg) {
+        return m.reply('❌ Reply to a session backup .zip file with .restore');
+    }
+
+    try {
+        const targetMsg = {
+            message: quoted,
+            key: {
+                remoteJid: m.from,
+                id: ctx.stanzaId,
+                fromMe: false,
+                participant: ctx.participant
+            }
+        };
+        const buffer = await downloadMediaMessage(targetMsg, 'buffer', {});
+        const zip = new AdmZip(buffer);
+
+        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+        zip.extractAllTo(AUTH_FOLDER, true);
+
+        await m.reply('✅ Session restored. Reconnecting...');
+
+        if (sock) {
+            try { sock.end(); } catch {}
+        }
+        setTimeout(() => startBot(), 2000);
+    } catch (err) {
+        await m.reply(`❌ Restore failed: ${err.message}`);
+    }
+}
+
+// --- Native command dispatcher — checked before the plugin registry ---
+async function handleNativeCommand(sock, m, rawMsg, commandName, args) {
+    switch (commandName) {
+        case 'anticall':
+            await handleToggle(m, args, 'antiCall', 'Anti-call');
+            return true;
+        case 'antispam':
+            await handleToggle(m, args, 'antiSpamEnabled', 'Anti-spam');
+            return true;
+        case 'warn':
+            await handleWarn(sock, m, rawMsg, args);
+            return true;
+        case 'resetwarn':
+            await handleResetWarn(m, rawMsg);
+            return true;
+        case 'sticker':
+        case 's':
+            await handleSticker(sock, m, rawMsg);
+            return true;
+        case 'broadcast':
+            if (!(m.isOwner || m.isDev)) { await m.reply('❌ Owner only.'); return true; }
+            await handleBroadcast(sock, m, args);
+            return true;
+        case 'backup':
+            if (!(m.isOwner || m.isDev)) { await m.reply('❌ Owner only.'); return true; }
+            await handleBackup(sock, m);
+            return true;
+        case 'restore':
+            if (!(m.isOwner || m.isDev)) { await m.reply('❌ Owner only.'); return true; }
+            await handleRestore(sock, m, rawMsg);
+            return true;
+        default:
+            return false;
+    }
 }
 // -----------------------------------------------------------------------
 
@@ -351,6 +609,26 @@ function startBot() {
                 console.log('💾 Credentials updated');
             });
 
+            // --- Anti-call: reject incoming calls when enabled ---
+            sock.ev.on('call', async (calls) => {
+                if (!global.antiCall) return;
+                for (const call of calls) {
+                    try {
+                        if (call.status === 'offer') {
+                            await sock.rejectCall(call.id, call.from);
+                            console.log(`📵 Rejected call from ${call.from}`);
+                            try {
+                                await sock.sendMessage(call.from, {
+                                    text: waBox('ANTI CALL', ['🚫 Calls are disabled for this bot.'])
+                                });
+                            } catch {}
+                        }
+                    } catch (err) {
+                        console.log('❌ Anti-call error:', err.message);
+                    }
+                }
+            });
+
             // global.plugins is shared with arslan.js's cmd() registry, so a
             // command-style plugin (const { cmd } = require('../arslan')) and a
             // legacy { name, execute } plugin land in the exact same Map.
@@ -481,6 +759,23 @@ function startBot() {
 
                 const m = await serializeMessage(sock, rawMsg);
 
+                // --- Anti-spam: rate-limit non-owner senders ---
+                if (global.antiSpamEnabled && !rawMsg.key.fromMe && m.sender) {
+                    const now = Date.now();
+                    const timestamps = (spamTracker.get(m.sender) || []).filter(
+                        t => now - t < global.antiSpamWindowMs
+                    );
+                    timestamps.push(now);
+                    spamTracker.set(m.sender, timestamps);
+
+                    if (timestamps.length > global.antiSpamLimit) {
+                        spamTracker.set(m.sender, []);
+                        try {
+                            await m.reply(waBox('ANTI SPAM', [`⚠️ Please slow down, ${m.pushName || 'there'}.`]));
+                        } catch {}
+                    }
+                }
+
                 if (global.autoRead) {
                     try { await sock.readMessages([rawMsg.key]); } catch (err) {}
                 }
@@ -516,6 +811,10 @@ function startBot() {
                 if (m.body && m.body.startsWith(global.BOT_PREFIX)) {
                     const args = m.body.slice(global.BOT_PREFIX.length).trim().split(/\s+/);
                     const commandName = args.shift().toLowerCase();
+
+                    const nativeHandled = await handleNativeCommand(sock, m, rawMsg, commandName, args);
+                    if (nativeHandled) return;
+
                     const plugin = plugins.get(commandName);
 
                     if (plugin) {
@@ -606,6 +905,11 @@ const server = http.createServer(async (req, res) => {
     if (urlPath === '/' || urlPath === '/qr') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`<img src="${latestQR}" />`);
+    } else if (urlPath === '/ping') {
+        // Lightweight route for self-pings and external uptime monitors —
+        // no work done, just proves the process is alive and accepting HTTP.
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('pong');
     } else if (urlPath === '/status' && req.method === 'GET') {
         // Enhanced: now also reports uptime and live mode/power/cmdreact
         // state from mode.js / bot-status.js / cmdreact.js, on top of the
@@ -652,12 +956,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 // -----------------------------------------------------------------------
-// Self-heal EADDRINUSE: without this, a failed .listen() surfaces as an
-// unhandled 'error' event on `server`, which the global uncaughtException
-// handler below only logs — leaving the process alive but with no HTTP
-// server actually bound to PORT (the panel then shows "Nothing to show"
-// even though the bot itself connects to WhatsApp fine). This retries
-// instead of leaving the process in that half-broken state.
+// Self-heal EADDRINUSE + graceful shutdown.
+//
+// Without server.on('error', ...), a failed .listen() surfaces as an
+// unhandled 'error' event, which the global uncaughtException handler
+// below only logs — leaving the process alive with no HTTP server bound
+// (the panel then shows "Nothing to show" even though the bot itself
+// connects to WhatsApp fine). This retries instead.
+//
+// The gracefulShutdown() handler below is the other half: if the panel's
+// restart/stop sends SIGTERM, this closes the socket cleanly so the NEXT
+// process to start doesn't hit EADDRINUSE against a lingering one. If your
+// panel force-kills (SIGKILL) instead of SIGTERM, this can't help — that's
+// a panel-level setting, not something index.js can intercept.
 // -----------------------------------------------------------------------
 let listenRetryTimer = null;
 
@@ -687,6 +998,54 @@ server.on('error', (err) => {
         console.error('❌ Server error:', err);
     }
 });
+
+function gracefulShutdown(signal) {
+    console.log(box('POPKID BOT', [`🛑 Received ${signal}`, '🔒 Closing server...']));
+    try {
+        server.close(() => process.exit(0));
+    } catch {
+        process.exit(0);
+    }
+    // Force-exit if close() hangs (e.g. keep-alive sockets still open)
+    setTimeout(() => process.exit(0), 3000);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+/* =========================================================
+KEEP-ALIVE — best-effort fix for hosts that sleep on inactivity
+========================================================= */
+// SELF_URL is your bot's public URL, e.g. https://yourapp.onrender.com
+// Set it as an env var. Render also auto-provides RENDER_EXTERNAL_URL.
+const SELF_URL = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
+
+function pingSelf() {
+    // Internal heartbeat — cheap, harmless, keeps the event loop busy.
+    // Only helps on hosts that watch process activity rather than
+    // external HTTP traffic.
+    http.get(`http://127.0.0.1:${PORT}/ping`, res => res.resume()).on('error', () => {});
+
+    // External-looking ping to the bot's own public URL — this is what
+    // actually resets most hosts' "no traffic for N minutes → sleep" timer.
+    if (SELF_URL) {
+        axios.get(`${SELF_URL.replace(/\/$/, '')}/ping`, { timeout: 10000 }).catch(() => {});
+    }
+}
+
+if (!SELF_URL) {
+    console.log(box('KEEP-ALIVE', [
+        '⚠️ SELF_URL not set — external self-ping is disabled.',
+        '📌 Set SELF_URL to your public URL, e.g.',
+        '   https://yourapp.onrender.com',
+        '📌 Or use a free monitor (UptimeRobot, cron-job.org, Better Uptime)',
+        '   hitting your /ping URL every 5 min — this is the most reliable',
+        '   fix for hosts that sleep on inactivity.'
+    ]));
+} else {
+    console.log(box('KEEP-ALIVE', [`✅ Self-ping enabled for ${SELF_URL}`]));
+}
+
+setInterval(pingSelf, 4 * 60 * 1000); // every 4 minutes
 
 startServer();
 global.server = server;
