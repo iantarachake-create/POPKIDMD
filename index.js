@@ -651,9 +651,44 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
-server.listen(PORT, () => {
-    console.log(box('POPKID BOT', [`🌐 Server listening on port ${PORT}`]));
+// -----------------------------------------------------------------------
+// Self-heal EADDRINUSE: without this, a failed .listen() surfaces as an
+// unhandled 'error' event on `server`, which the global uncaughtException
+// handler below only logs — leaving the process alive but with no HTTP
+// server actually bound to PORT (the panel then shows "Nothing to show"
+// even though the bot itself connects to WhatsApp fine). This retries
+// instead of leaving the process in that half-broken state.
+// -----------------------------------------------------------------------
+let listenRetryTimer = null;
+
+function startServer() {
+    server.listen(PORT, () => {
+        console.log(box('POPKID BOT', [`🌐 Server listening on port ${PORT}`]));
+    });
+}
+
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(box('POPKID BOT', [
+            `⚠️ Port ${PORT} already in use.`,
+            `🔁 Retrying in 5s...`
+        ]));
+
+        if (listenRetryTimer) return;
+
+        listenRetryTimer = setTimeout(() => {
+            listenRetryTimer = null;
+            try {
+                server.close();
+            } catch {}
+            startServer();
+        }, 5000);
+    } else {
+        console.error('❌ Server error:', err);
+    }
 });
+
+startServer();
 global.server = server;
 global.PORT = PORT;
 loadPrefix();
