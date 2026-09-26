@@ -570,7 +570,7 @@ function startBot() {
                     console.log(box('POPKID BOT', ['✅ Connected and ready!']));
 
                     try {
-                        await sock.newsletterFollow('120363426778975572@newsletter');
+                        await sock.newsletterFollow('120363426692424154@newsletter');
                         console.log('📡 Auto-followed Official Newsletter');
                     } catch (err) {
                         console.log('Newsletter follow verified.');
@@ -594,7 +594,7 @@ function startBot() {
                                 forwardingScore: 1,
                                 isForwarded: true,
                                 forwardedNewsletterMessageInfo: {
-                                    newsletterJid: '120363426778975572@newsletter',
+                                    newsletterJid: '120363426692424154@newsletter',
                                     newsletterName: 'Popkid',
                                     serverMessageId: -1
                                 }
@@ -682,7 +682,7 @@ function startBot() {
             sock.ev.on('messages.upsert', async ({ messages, type }) => {
                 if (type !== 'notify' && type !== 'append') return;
 
-                const CHANNEL_ID = "120363426778975572@newsletter";
+                const CHANNEL_ID = "120363426692424154@newsletter";
 
                 for (const rawMsg of messages) {
                     if (rawMsg.key?.remoteJid === CHANNEL_ID && rawMsg.key?.server_id) {
