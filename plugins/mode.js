@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { cmd } = require('../arslan');
+const { sendBtns } = require('../lib/buttons');
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const MODE_FILE = path.join(DATA_DIR, 'bot-mode.json');
@@ -222,40 +223,16 @@ cmd({
 ┗▣`);
     }
 
-    // STATUS
-    if (
-        action === 'status' ||
-        action === 'check'
-    ) {
-
-        const status =
-            currentMode === 'private'
-                ? '🔒 PRIVATE'
-                : '🌐 PUBLIC';
-
-        return m.reply(`┏▣ ◈ *𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗢𝗗𝗘* ◈
-┃
-┃⚙️ *BOT MODE*
-┃
-┃➽ *STATUS* : ${status}
-┃
-┃📌 *COMMANDS*
-┃➽ .mode public
-┃➽ .mode private
-┃➽ .mode status
-┃
-┗▣`);
-    }
-
-    return m.reply(`┏▣ ◈ *𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗢𝗗𝗘* ◈
-┃
-┃📖 *USAGE*
-┃
-┃➽ .mode public
-┃➽ .mode private
-┃➽ .mode status
-┃
-┗▣`);
+    // STATUS / USAGE -> tap-to-switch buttons
+    const status = currentMode === 'private' ? '🔒 PRIVATE' : '🌐 PUBLIC';
+    return sendBtns(sock, m, {
+        title: '𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗢𝗗𝗘',
+        text: `⚙️ *BOT MODE*\n\n➽ *STATUS* : ${status}\n\nTap a button to switch mode.`,
+        buttons: [
+            { text: '🌐 Public', cmd: 'mode public' },
+            { text: '🔒 Private', cmd: 'mode private' }
+        ]
+    });
 });
 
 // Install protection after the command has registered.
