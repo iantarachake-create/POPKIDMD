@@ -13,6 +13,7 @@ const { decodeSessionId } = require('./lib/sessionLoader');
 const { AntideleteHandler } = require('./lib/antidelete');
 const { handleChatbotResponse } = require('./lib/chatbot');
 const { handleLinkDetection } = require('./lib/antilink');
+const autobio = require('./lib/autobio');
 const AdmZip = require('adm-zip');
 
 // Optional dependencies — degrade gracefully instead of crashing the whole
@@ -527,6 +528,7 @@ function startBot() {
                         clearInterval(presenceInterval);
                         presenceInterval = null;
                     }
+                    autobio.stop();
 
                     const statusCode = (lastDisconnect?.error instanceof Boom)
                         ? lastDisconnect.error.output.statusCode
@@ -563,6 +565,9 @@ function startBot() {
 
                     // Small delay so the socket is fully ready before sending
                     await new Promise(resolve => setTimeout(resolve, 1500));
+
+                    // Live bio: shows right away on connect, then refreshes every minute
+                    autobio.start(sock);
 
                     // Clean self-JID (strip :device suffix) so the DM actually lands
                     const botNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
