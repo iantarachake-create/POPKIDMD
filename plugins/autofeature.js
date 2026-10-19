@@ -42,8 +42,8 @@ cmd({
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
 cmd({
-    pattern: "autoview",
-    name: "autoview",
+    pattern: "autostatusview",
+    name: "autostatusview",
     category: "Admin",
     aliases: ["av"],
     description: "Toggle automatic status viewing",
@@ -59,7 +59,7 @@ cmd({
 ┃
 ┃👁️ *𝗦𝗧𝗔𝗧𝗨𝗦* : ${global.autoView ? "𝗢𝗡" : "𝗢𝗙𝗙"}
 ┃
-┃➽ 𝗨𝗦𝗘 : .autoview on/off
+┃➽ 𝗨𝗦𝗘 : .autostatusview on/off
 ┃
 ┗▣`);
     }
@@ -79,8 +79,8 @@ cmd({
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
 cmd({
-    pattern: "autolike",
-    name: "autolike",
+    pattern: "autolikestatus",
+    name: "autolikestatus",
     category: "Admin",
     aliases: ["al"],
     description: "Toggle automatic status likes",
@@ -96,7 +96,7 @@ cmd({
 ┃
 ┃❤️ *𝗦𝗧𝗔𝗧𝗨𝗦* : ${global.autoLike ? "𝗢𝗡" : "𝗢𝗙𝗙"}
 ┃
-┃➽ 𝗨𝗦𝗘 : .autolike on/off
+┃➽ 𝗨𝗦𝗘 : .autolikestatus on/off
 ┃
 ┗▣`);
     }
