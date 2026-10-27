@@ -19,7 +19,7 @@ cmd({
         day: 'numeric', 
         month: 'long', 
         year: 'numeric',
-        timeZone: 'Africa/Accra'
+        timeZone: global.timezone || 'Africa/Accra'
     });
     
     const time = now.toLocaleTimeString('en-US', { 
@@ -27,7 +27,7 @@ cmd({
         minute: '2-digit', 
         second: '2-digit',
         hour12: true,
-        timeZone: 'Africa/Accra'
+        timeZone: global.timezone || 'Africa/Accra'
     });
     
     const botOwner = global.ownerName || 'POPKID';
@@ -49,7 +49,7 @@ cmd({
 
     // Auto-build the command list from whatever plugins are actually loaded,
     // so new plugins show up here automatically without editing this file.
-    const CATEGORY_ORDER = ['General', 'Downloaders', 'Tools', 'AI', 'Fun', 'Group', 'Status', 'Channel', 'Admin'];
+    const CATEGORY_ORDER = ['General', 'Downloaders', 'Tools', 'AI', 'Fun', 'Ephoto360', 'Group', 'Status', 'Channel', 'Admin', 'Settings'];
     
     const CATEGORY_ICONS = {
         General: '📜',
@@ -60,7 +60,9 @@ cmd({
         Group: '👥',
         Status: '📡',
         Channel: '📢',
-        Admin: '👑'
+        Admin: '👑',
+        Ephoto360: '🎨',
+        Settings: '⚙️'
     };
 
     const grouped = {};
@@ -77,7 +79,7 @@ cmd({
             if (seen.has(plugin.name)) continue;
             seen.add(plugin.name);
 
-            const category = plugin.category || 'General';
+            const category = (global.settingsMenuNames && global.settingsMenuNames.has(plugin.name)) ? 'Settings' : (plugin.category || 'General');
             
             if (!grouped[category]) grouped[category] = [];
             grouped[category].push(`${prefix}${plugin.name}`);
@@ -89,8 +91,13 @@ cmd({
         ...Object.keys(grouped).filter(c => !CATEGORY_ORDER.includes(c))
     ];
 
+    const menuStyle = Number(global.menuStyle) || 1;
     const commandSections = allCategories.map(category => {
         const icon = CATEGORY_ICONS[category] || '📂';
+        if (category === 'Settings') grouped[category].sort();
+        if (menuStyle === 3) {
+            return `${icon} *${category.toUpperCase()}*\n${grouped[category].join(' • ')}`;
+        }
         const lines = grouped[category]
             .map(l => `┃➽ ${l}`)
             .join('\n');
@@ -101,7 +108,7 @@ ${BOT}`;
     }).join('\n\n');
 
     const menuText = `
-${TOP} ◈ *𝗣𝗢𝗣𝗞𝗜𝗗* ◈
+${TOP} ◈ *${(global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗'}* ◈
 ${MID} *ᴏᴡɴᴇʀ* : ${botOwner}
 ${MID} *ᴜsᴇʀ* : ${user}
 ${MID} *ᴘʟᴜɢɪɴs* : ${totalPlugins}
@@ -116,31 +123,25 @@ ${commandSections}
 *© 𝗣𝗢𝗣𝗞𝗜𝗗*
 `.trim();
 
-    try {    
-        if (!global.menuImage) throw new Error('global.menuImage is not set');
+    try {
+        const media = menuStyle === 2 ? null : await require('../lib/menuMedia').pickMenuMedia();
+        if (!media) return await m.reply(menuText);
 
-        // global.menuImage can now be either a remote URL (default) or a
-        // local file path saved by the .setmenuimg command.
-        const imageBuffer = /^https?:\/\//i.test(global.menuImage)
-            ? (await axios.get(global.menuImage, {
-                responseType: 'arraybuffer',
-                timeout: 8000
-            })).data
-            : fs.readFileSync(global.menuImage);
-        
-        await m.reply(imageBuffer, { 
-            caption: menuText,
-            contextInfo: {
-                forwardingScore: 999,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                    newsletterJid: '120363426778975572@newsletter',
-                    newsletterName: '😷popkid😷',
-                    serverMessageId: 1
-                }
+        const ctxInfo = {
+            forwardingScore: 999,
+            isForwarded: true,
+            forwardedNewsletterMessageInfo: {
+                newsletterJid: '120363426692424154@newsletter',
+                newsletterName: '𝗣𝗢𝗣𝗞𝗜𝗗',
+                serverMessageId: 1
             }
-        });
-        
+        };
+
+        if (media.kind === 'video') {
+            await sock.sendMessage(m.from, { video: media.buffer, gifPlayback: true, caption: menuText, contextInfo: ctxInfo }, { quoted: m.raw });
+        } else {
+            await m.reply(media.buffer, { caption: menuText, contextInfo: ctxInfo });
+        }
     } catch (err) {    
         console.error('Menu image error, falling back to text:', err.message);
         try {
