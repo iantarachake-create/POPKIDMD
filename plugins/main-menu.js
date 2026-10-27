@@ -3,6 +3,11 @@ const fs = require('fs');
 
 const { cmd } = require('../arslan');
 
+// WhatsApp rejects image captions that are too long. Anything that does not fit in the
+// picture's caption continues straight after it in the same style, so every command is listed.
+const MAX_CAPTION = 3000;
+const MAX_TEXT = 3800;
+
 cmd({
     pattern: "menu",
     name: 'menu',
@@ -19,14 +24,6 @@ cmd({
         day: 'numeric', 
         month: 'long', 
         year: 'numeric',
-        timeZone: global.timezone || 'Africa/Accra'
-    });
-    
-    const time = now.toLocaleTimeString('en-US', { 
-        hour: '2-digit', 
-        minute: '2-digit', 
-        second: '2-digit',
-        hour12: true,
         timeZone: global.timezone || 'Africa/Accra'
     });
     
@@ -50,20 +47,6 @@ cmd({
     // Auto-build the command list from whatever plugins are actually loaded,
     // so new plugins show up here automatically without editing this file.
     const CATEGORY_ORDER = ['General', 'Downloaders', 'Tools', 'AI', 'Fun', 'Ephoto360', 'Group', 'Status', 'Channel', 'Admin', 'Settings'];
-    
-    const CATEGORY_ICONS = {
-        General: '📜',
-        Downloaders: '💼',
-        Tools: '🛠️',
-        AI: '🧠',
-        Fun: '🎉',
-        Group: '👥',
-        Status: '📡',
-        Channel: '📢',
-        Admin: '👑',
-        Ephoto360: '🎨',
-        Settings: '⚙️'
-    };
 
     const grouped = {};
     const seen = new Set();
@@ -79,7 +62,10 @@ cmd({
             if (seen.has(plugin.name)) continue;
             seen.add(plugin.name);
 
-            const category = (global.settingsMenuNames && global.settingsMenuNames.has(plugin.name)) ? 'Settings' : (plugin.category || 'General');
+            // commands from the Settings menu are always shown under SETTINGS
+            const category = (global.settingsMenuNames && global.settingsMenuNames.has(plugin.name))
+                ? 'Settings'
+                : (plugin.category || 'General');
             
             if (!grouped[category]) grouped[category] = [];
             grouped[category].push(`${prefix}${plugin.name}`);
@@ -92,23 +78,39 @@ cmd({
     ];
 
     const menuStyle = Number(global.menuStyle) || 1;
-    const sectionList = allCategories.map(category => {
-        const icon = CATEGORY_ICONS[category] || '📂';
-        if (category === 'Settings') grouped[category].sort();
+
+    // One box per category (a very long category is continued in a second box, same look).
+    const buildBlocks = (category, maxLen) => {
+        const title = category.toUpperCase();
+        const cmds = category === 'Settings' ? grouped[category].slice().sort() : grouped[category];
+
         if (menuStyle === 3) {
-            return `${icon} *${category.toUpperCase()}*\n${grouped[category].join(' • ')}`;
+            return [`*${title}*\n${cmds.join(' • ')}`];
         }
-        const lines = grouped[category]
-            .map(l => `┃➽ ${l}`)
-            .join('\n');
 
-        return `${TOP} ◈ *${category.toUpperCase()} MENU* ◈
-${lines}
-${BOT}`;
-    });
-    const commandSections = sectionList.join('\n\n');
+        const blocks = [];
+        let lines = [];
+        const open = n => `${TOP} ◈ *${title} MENU${n > 1 ? ` (${n})` : ''}* ◈`;
+        const render = n => `${open(n)}\n${lines.join('\n')}\n${BOT}`;
 
-    const headerText = `${TOP} ◈ *${(global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗'}* ◈
+        let part = 1;
+        for (const c of cmds) {
+            const line = `┃➽ ${c}`;
+            if (lines.length && (render(part).length + line.length + 1) > maxLen) {
+                blocks.push(render(part));
+                lines = [];
+                part++;
+            }
+            lines.push(line);
+        }
+        if (lines.length) blocks.push(render(part));
+        return blocks;
+    };
+
+    const blocks = allCategories.flatMap(c => buildBlocks(c, MAX_TEXT));
+
+    const headerText = `
+${TOP} ◈ *${(global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗'}* ◈
 ${MID} *ᴏᴡɴᴇʀ* : ${botOwner}
 ${MID} *ᴜsᴇʀ* : ${user}
 ${MID} *ᴘʟᴜɢɪɴs* : ${totalPlugins}
@@ -116,59 +118,78 @@ ${MID} *ᴜᴘᴛɪᴍᴇ* : ${uptimeStr}
 ${MID} *ᴅᴀᴛᴇ* : ${date}
 ${MID} *ʀᴀᴍ* : ${ramStr}
 ${MID} *ᴘʀᴇғɪx* : [ ${prefix} ]
-${BOT}`;
+${BOT}`.trim();
+
     const footer = '*© 𝗣𝗢𝗣𝗞𝗜𝗗*';
 
-    // Split the long command list into readable messages (WhatsApp rejects very long image captions,
-    // so the picture only carries the short info box above).
-    const chunks = [];
+    // Fill the first message (the picture's caption) as far as the safe limit allows,
+    // then pack whatever is left into follow-up text messages.
+    let caption = headerText;
+    let idx = 0;
+    const captionLimit = menuStyle === 2 ? MAX_TEXT : MAX_CAPTION;
+    while (idx < blocks.length && (caption.length + 2 + blocks[idx].length) <= captionLimit - footer.length - 2) {
+        caption += `\n\n${blocks[idx++]}`;
+    }
+
+    const rest = [];
     let current = '';
-    for (const section of sectionList) {
-        if (current && (current.length + section.length + 2) > 3500) {
-            chunks.push(current);
-            current = section;
+    for (; idx < blocks.length; idx++) {
+        if (current && (current.length + 2 + blocks[idx].length) > MAX_TEXT) {
+            rest.push(current);
+            current = blocks[idx];
         } else {
-            current = current ? `${current}\n\n${section}` : section;
+            current = current ? `${current}\n\n${blocks[idx]}` : blocks[idx];
         }
     }
-    if (current) chunks.push(current);
-    if (!chunks.length) chunks.push('No commands loaded.');
-    chunks[chunks.length - 1] += `\n\n${footer}`;
+    if (current) rest.push(current);
 
-    // 1) picture / video with the short info box
-    let mediaSent = false;
+    // footer goes on the very last message
+    if (rest.length) rest[rest.length - 1] += `\n\n${footer}`;
+    else caption += `\n\n${footer}`;
+
+    let firstSent = false;
+
     if (menuStyle !== 2) {
         try {
-            const media = await require('../lib/menuMedia').pickMenuMedia();
-            if (media) {
-                const ctxInfo = {
-                    forwardingScore: 999,
-                    isForwarded: true,
-                    forwardedNewsletterMessageInfo: {
-                        newsletterJid: '120363426778975572@newsletter',
-                        newsletterName: '😷popkid😷',
-                        serverMessageId: 1
-                    }
-                };
-                if (media.kind === 'video') {
-                    await sock.sendMessage(m.from, { video: media.buffer, gifPlayback: true, caption: headerText, contextInfo: ctxInfo }, { quoted: m.raw });
-                } else {
-                    await m.reply(media.buffer, { caption: headerText, contextInfo: ctxInfo });
-                }
-                mediaSent = true;
-            } else {
-                console.error('Menu: no menu image could be loaded (check .setmenuimg / global.menuImage)');
+            // picture / video: a rotation added with .addmenuimage / .addmenuvideo, else global.menuImage
+            // (a remote URL, or a local file saved by .setmenuimg)
+            let media = null;
+            try { media = await require('../lib/menuMedia').pickMenuMedia(); } catch (e) { console.error('menuMedia error:', e.message); }
+
+            if (!media && global.menuImage) {
+                const buffer = /^https?:\/\//i.test(global.menuImage)
+                    ? (await axios.get(global.menuImage, { responseType: 'arraybuffer', timeout: 8000 })).data
+                    : fs.readFileSync(global.menuImage);
+                media = { kind: 'image', buffer };
             }
-        } catch (err) {
+            if (!media) throw new Error('no menu image or video could be loaded');
+
+            const contextInfo = {
+                forwardingScore: 999,
+                isForwarded: true,
+                forwardedNewsletterMessageInfo: {
+                    newsletterJid: '120363426692424154@newsletter',
+                    newsletterName: '😷popkid😷',
+                    serverMessageId: 1
+                }
+            };
+
+            if (media.kind === 'video') {
+                await sock.sendMessage(m.from, { video: media.buffer, gifPlayback: true, caption, contextInfo }, { quoted: m.raw });
+            } else {
+                await m.reply(media.buffer, { caption, contextInfo });
+            }
+            firstSent = true;
+        } catch (err) {    
             console.error('Menu image error, falling back to text:', err.message);
         }
     }
+
     try {
-        if (!mediaSent) await m.reply(headerText);
-        // 2) the command list
-        for (const chunk of chunks) {
-            await m.reply(chunk);
-            await new Promise(r => setTimeout(r, 400));
+        if (!firstSent) await m.reply(caption);
+        for (const text of rest) {
+            await new Promise(r => setTimeout(r, 500));
+            await m.reply(text);
         }
     } catch (err2) {
         console.error('Menu text error:', err2.message);
