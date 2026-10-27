@@ -92,7 +92,7 @@ cmd({
     ];
 
     const menuStyle = Number(global.menuStyle) || 1;
-    const commandSections = allCategories.map(category => {
+    const sectionList = allCategories.map(category => {
         const icon = CATEGORY_ICONS[category] || '📂';
         if (category === 'Settings') grouped[category].sort();
         if (menuStyle === 3) {
@@ -105,10 +105,10 @@ cmd({
         return `${TOP} ◈ *${category.toUpperCase()} MENU* ◈
 ${lines}
 ${BOT}`;
-    }).join('\n\n');
+    });
+    const commandSections = sectionList.join('\n\n');
 
-    const menuText = `
-${TOP} ◈ *${(global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗'}* ◈
+    const headerText = `${TOP} ◈ *${(global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗'}* ◈
 ${MID} *ᴏᴡɴᴇʀ* : ${botOwner}
 ${MID} *ᴜsᴇʀ* : ${user}
 ${MID} *ᴘʟᴜɢɪɴs* : ${totalPlugins}
@@ -116,38 +116,61 @@ ${MID} *ᴜᴘᴛɪᴍᴇ* : ${uptimeStr}
 ${MID} *ᴅᴀᴛᴇ* : ${date}
 ${MID} *ʀᴀᴍ* : ${ramStr}
 ${MID} *ᴘʀᴇғɪx* : [ ${prefix} ]
-${BOT}
+${BOT}`;
+    const footer = '*© 𝗣𝗢𝗣𝗞𝗜𝗗*';
 
-${commandSections}
-
-*© 𝗣𝗢𝗣𝗞𝗜𝗗*
-`.trim();
-
-    try {
-        const media = menuStyle === 2 ? null : await require('../lib/menuMedia').pickMenuMedia();
-        if (!media) return await m.reply(menuText);
-
-        const ctxInfo = {
-            forwardingScore: 999,
-            isForwarded: true,
-            forwardedNewsletterMessageInfo: {
-                newsletterJid: '120363426692424154@newsletter',
-                newsletterName: '𝗣𝗢𝗣𝗞𝗜𝗗',
-                serverMessageId: 1
-            }
-        };
-
-        if (media.kind === 'video') {
-            await sock.sendMessage(m.from, { video: media.buffer, gifPlayback: true, caption: menuText, contextInfo: ctxInfo }, { quoted: m.raw });
+    // Split the long command list into readable messages (WhatsApp rejects very long image captions,
+    // so the picture only carries the short info box above).
+    const chunks = [];
+    let current = '';
+    for (const section of sectionList) {
+        if (current && (current.length + section.length + 2) > 3500) {
+            chunks.push(current);
+            current = section;
         } else {
-            await m.reply(media.buffer, { caption: menuText, contextInfo: ctxInfo });
+            current = current ? `${current}\n\n${section}` : section;
         }
-    } catch (err) {    
-        console.error('Menu image error, falling back to text:', err.message);
+    }
+    if (current) chunks.push(current);
+    if (!chunks.length) chunks.push('No commands loaded.');
+    chunks[chunks.length - 1] += `\n\n${footer}`;
+
+    // 1) picture / video with the short info box
+    let mediaSent = false;
+    if (menuStyle !== 2) {
         try {
-            await m.reply(menuText);
-        } catch (err2) {
-            console.error('Menu fallback error:', err2.message);
+            const media = await require('../lib/menuMedia').pickMenuMedia();
+            if (media) {
+                const ctxInfo = {
+                    forwardingScore: 999,
+                    isForwarded: true,
+                    forwardedNewsletterMessageInfo: {
+                        newsletterJid: '120363426778975572@newsletter',
+                        newsletterName: '😷popkid😷',
+                        serverMessageId: 1
+                    }
+                };
+                if (media.kind === 'video') {
+                    await sock.sendMessage(m.from, { video: media.buffer, gifPlayback: true, caption: headerText, contextInfo: ctxInfo }, { quoted: m.raw });
+                } else {
+                    await m.reply(media.buffer, { caption: headerText, contextInfo: ctxInfo });
+                }
+                mediaSent = true;
+            } else {
+                console.error('Menu: no menu image could be loaded (check .setmenuimg / global.menuImage)');
+            }
+        } catch (err) {
+            console.error('Menu image error, falling back to text:', err.message);
         }
-    }    
+    }
+    try {
+        if (!mediaSent) await m.reply(headerText);
+        // 2) the command list
+        for (const chunk of chunks) {
+            await m.reply(chunk);
+            await new Promise(r => setTimeout(r, 400));
+        }
+    } catch (err2) {
+        console.error('Menu text error:', err2.message);
+    }
 });
