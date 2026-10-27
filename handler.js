@@ -169,7 +169,13 @@ async function serializeMessage(sock, msg) {
         }
     }
 
+    const anyCtx = Object.values(msg.message || {}).find(v => v && typeof v === 'object' && v.contextInfo)?.contextInfo || null
+
     return {
+        raw: msg,
+        message: msg.message,
+        contextInfo: anyCtx,
+        mentionedJid: anyCtx?.mentionedJid || [],
         key: msg.key,  // Add this line
         id: msg.key?.id,
         from,
