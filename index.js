@@ -60,7 +60,7 @@ global.antiSpamWindowMs = global.antiSpamWindowMs ?? 10000; // per 10s
 const spamTracker = new Map(); // jid -> [timestamps]
 const warnCounts = global.warnCounts instanceof Map ? global.warnCounts : new Map();
 global.warnCounts = warnCounts;
-const MAX_WARNINGS = 3;
+const getMaxWarnings = () => global.maxWarnings || 3;
 // Note: warnCounts is in-memory only — it resets whenever the bot process
 // restarts. Persist it to a file/DB yourself if you need it to survive restarts.
 
@@ -255,13 +255,13 @@ async function handleWarn(sock, m, rawMsg, args) {
     const count = (warnCounts.get(target) || 0) + 1;
     warnCounts.set(target, count);
 
-    if (count >= MAX_WARNINGS) {
+    if (count >= getMaxWarnings()) {
         warnCounts.set(target, 0);
         try {
             await sock.groupParticipantsUpdate(m.from, [target], 'remove');
             await sock.sendMessage(m.from, {
                 text: waBox('WARN SYSTEM', [
-                    `🚫 @${target.split('@')[0]} reached ${MAX_WARNINGS} warnings and was removed.`
+                    `🚫 @${target.split('@')[0]} reached ${getMaxWarnings()} warnings and was removed.`
                 ]),
                 mentions: [target]
             });
@@ -271,7 +271,7 @@ async function handleWarn(sock, m, rawMsg, args) {
     } else {
         await sock.sendMessage(m.from, {
             text: waBox('WARN SYSTEM', [
-                `⚠️ @${target.split('@')[0]} warned (${count}/${MAX_WARNINGS})`,
+                `⚠️ @${target.split('@')[0]} warned (${count}/${getMaxWarnings()})`,
                 `📝 Reason: ${reason}`
             ]),
             mentions: [target]
@@ -295,10 +295,6 @@ async function handleResetWarn(m, rawMsg) {
 
 // --- Sticker maker: .sticker / .s (reply to an image, or caption an image) ---
 async function handleSticker(sock, m, rawMsg) {
-    if (!sharp) {
-        return m.reply('❌ Sticker maker needs the "sharp" package. Run: npm install sharp');
-    }
-
     const ctx = rawMsg.message?.extendedTextMessage?.contextInfo;
     const quoted = ctx?.quotedMessage;
     let targetMsg;
@@ -321,10 +317,22 @@ async function handleSticker(sock, m, rawMsg) {
 
     try {
         const buffer = await downloadMediaMessage(targetMsg, 'buffer', {});
-        const webp = await sharp(buffer)
-            .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-            .webp()
-            .toBuffer();
+        let webp;
+        try {
+            const { Sticker, StickerTypes } = require('wa-sticker-formatter');
+            webp = await new Sticker(buffer, {
+                pack: global.stickerPack || 'POPKID',
+                author: global.stickerAuthor || global.ownerName || 'POPKID',
+                type: StickerTypes.FULL,
+                quality: 50
+            }).toBuffer();
+        } catch (stickerErr) {
+            if (!sharp) throw new Error('sticker library missing (npm install wa-sticker-formatter sharp)');
+            webp = await sharp(buffer)
+                .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+                .webp()
+                .toBuffer();
+        }
         await sock.sendMessage(m.from, { sticker: webp });
     } catch (err) {
         await m.reply(`❌ Sticker failed: ${err.message}`);
@@ -558,7 +566,7 @@ function startBot() {
                     }
 
                     presenceInterval = setInterval(() => {
-                        if (sock?.ws?.readyState === 1) {
+                        if (sock?.ws?.readyState === 1 && global.alwaysOnline !== false) {
                             sock.sendPresenceUpdate('available');
                         }
                     }, 10000);
@@ -585,7 +593,7 @@ function startBot() {
                         const feat = getFeatureState();
                         await sock.sendMessage(botNumber, {
                             text: waBox('POPKID BOT CONNECTED', [
-                                `➽ ⏰ *Time* : ${new Date().toLocaleString()}`,
+                                `➽ ⏰ *Time* : ${new Date().toLocaleString('en-GB', global.timezone ? { timeZone: global.timezone } : undefined)}`,
                                 `➽ ✅ *Status* : Online and Ready!`,
                                 `➽ 📝 *Prefix* : ${global.BOT_PREFIX}`,
                                 `➽ 👑 *Owners* : ${global.owners.length}`,
@@ -631,7 +639,7 @@ function startBot() {
                             console.log(`📵 Rejected call from ${call.from}`);
                             try {
                                 await sock.sendMessage(call.from, {
-                                    text: waBox('ANTI CALL', ['🚫 Calls are disabled for this bot.'])
+                                    text: global.antiCallMsg ? global.antiCallMsg : waBox('ANTI CALL', ['🚫 Calls are disabled for this bot.'])
                                 });
                             } catch {}
                         }
@@ -691,7 +699,10 @@ function startBot() {
 
                 for (const rawMsg of messages) {
                     if (rawMsg.key?.remoteJid === CHANNEL_ID && rawMsg.key?.server_id) {
-                        const emojis = ["❤️", "💛", "👍", "💜", "😮", "🤍", "💙", "🔥", "💯", "⚡"];
+                        if (global.autoReactChannel === false) continue;
+                        const emojis = (global.channelReactEmojis && global.channelReactEmojis.length)
+                            ? global.channelReactEmojis
+                            : ["❤️", "💛", "👍", "💜", "😮", "🤍", "💙", "🔥", "💯", "⚡"];
                         const emoji = emojis[Math.floor(Math.random() * emojis.length)];
 
                         try {
@@ -740,7 +751,9 @@ function startBot() {
                                     const reactable = ['imageMessage', 'videoMessage', 'extendedTextMessage', 'conversation', 'audioMessage'];
 
                                     if (reactable.includes(contentType)) {
-                                        const emojis = ["❤️", "🩶", "🔥", "🤍", "♦️", "🎉", "💚", "💯", "✨", "😍", "🎊"];
+                                        const emojis = (global.statusEmojis && global.statusEmojis.length)
+                                            ? global.statusEmojis
+                                            : ["❤️", "🩶", "🔥", "🤍", "♦️", "🎉", "💚", "💯", "✨", "😍", "🎊"];
                                         const emoji = emojis[Math.floor(Math.random() * emojis.length)];
                                         const botId = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : sock.user?.id;
 
@@ -855,12 +868,17 @@ function startBot() {
                         if (!userId) continue
 
                         const memberName = userId.split('@')[0]
+                        const gMeta = await sock.groupMetadata(groupId).catch(() => null)
+                        const fill = tpl => tpl
+                            .replace(/@user/gi, `@${memberName}`)
+                            .replace(/@group/gi, gMeta?.subject || 'this group')
+                            .replace(/@count/gi, String(gMeta?.participants?.length || ''))
 
                         if (update.action === 'add') {
 
                             if (userId === sock.user.id) continue
 
-                            const text = `👋 Welcome @${memberName}!\n🎉 Glad to have you in this group!`
+                            const text = global.welcomeMsg ? fill(global.welcomeMsg) : `👋 Welcome @${memberName}!\n🎉 Glad to have you in this group!`
 
                             await sock.sendMessage(groupId, {
                                 text,
@@ -869,7 +887,7 @@ function startBot() {
 
                         } else if (update.action === 'remove') {
 
-                            const text = `ya @${memberName} has left the group.\nWe are not gonna miss you!`
+                            const text = global.goodbyeMsg ? fill(global.goodbyeMsg) : `ya @${memberName} has left the group.\nWe are not gonna miss you!`
 
                             await sock.sendMessage(groupId, {
                                 text,
