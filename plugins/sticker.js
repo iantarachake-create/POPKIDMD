@@ -27,8 +27,8 @@ cmd({
             }
 
             const sticker = new Sticker(mediaBuffer, {
-                pack: 'POPKID',
-                author: 'Abraham',
+                pack: global.stickerPack || 'POPKID',
+                author: global.stickerAuthor || global.ownerName || 'POPKID',
                 type: StickerTypes.FULL,
                 quality: 50,
             });
