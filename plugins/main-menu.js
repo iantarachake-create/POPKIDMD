@@ -16,8 +16,9 @@ const MAX_SINGLE = 20000;   // the whole menu goes out as ONE message up to this
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const CACHE_FILE = path.join(DATA_DIR, 'menu-cache.jpg');     // last remote image that worked
 const DEFAULT_FILE = path.join(DATA_DIR, 'menu-default.jpg'); // bundled picture, always available
-const FETCH_TIMEOUT = 10000;   // per remote image
-const BUDGET_MS = 25000;       // total time allowed to find a picture
+const FETCH_TIMEOUT = 4000;    // per remote image (the menu must stay quick)
+const BUDGET_MS = 8000;        // total time allowed to find a picture
+const FAIL_TTL = 30 * 60 * 1000; // a link that failed is not retried for this long
 const MAX_VIDEO_BYTES = 15 * 1024 * 1024;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
 
@@ -35,36 +36,67 @@ function sniff(b) {
     return null;
 }
 
-// Remote files are kept in memory for a while so every .menu doesn't download them again
-const memCache = new Map(); // src -> { buffer, kind, expires }
+// Remote files are kept in memory, so after the first load every .menu is instant.
+// An old copy keeps being used while a fresh one downloads quietly in the background.
+const memCache = new Map();    // src -> { buffer, kind, fetched }
+const failed = new Map();      // src -> time until which it is skipped
+const refreshing = new Set();
+const thumbCache = new Map();  // src -> small jpeg for the preview card
 const MEM_TTL = 30 * 60 * 1000;
+
+async function fetchRemote(src, timeout) {
+    const res = await axios.get(src, {
+        responseType: 'arraybuffer',
+        timeout,
+        maxContentLength: 30 * 1024 * 1024,
+        headers: { 'User-Agent': UA, Accept: 'image/*,video/*,*/*;q=0.8' }
+    });
+    const buffer = Buffer.from(res.data);
+    const kind = sniff(buffer);
+    if (!kind) throw new Error('not a picture or video');
+
+    if (memCache.size >= 20) memCache.delete(memCache.keys().next().value);
+    memCache.set(src, { buffer, kind, fetched: Date.now() });
+    thumbCache.delete(src);
+    failed.delete(src);
+
+    if (kind === 'image' && buffer.length < 5 * 1024 * 1024) {
+        try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(CACHE_FILE, buffer); } catch (_) { /* cache is optional */ }
+    }
+    return { kind, buffer };
+}
+
+function refreshInBackground(src) {
+    if (refreshing.has(src)) return;
+    refreshing.add(src);
+    fetchRemote(src, 15000)
+        .catch(() => { failed.set(src, Date.now() + FAIL_TTL); })
+        .finally(() => refreshing.delete(src));
+}
 
 async function loadSource(src, deadline) {
     if (/^https?:\/\//i.test(src)) {
         const hit = memCache.get(src);
-        if (hit && hit.expires > Date.now()) return { kind: hit.kind, buffer: hit.buffer, remote: false };
+        if (hit) {
+            if (Date.now() - hit.fetched > MEM_TTL) refreshInBackground(src);
+            return { kind: hit.kind, buffer: hit.buffer };
+        }
+        if ((failed.get(src) || 0) > Date.now()) throw new Error('skipped, it failed recently');
 
-        const timeout = Math.max(3000, Math.min(FETCH_TIMEOUT, deadline - Date.now()));
-        const res = await axios.get(src, {
-            responseType: 'arraybuffer',
-            timeout,
-            maxContentLength: 30 * 1024 * 1024,
-            headers: { 'User-Agent': UA, Accept: 'image/*,video/*,*/*;q=0.8' }
-        });
-        const buffer = Buffer.from(res.data);
-        const kind = sniff(buffer);
-        if (!kind) throw new Error('not a picture or video');
-
-        if (memCache.size >= 8) memCache.delete(memCache.keys().next().value);
-        memCache.set(src, { buffer, kind, expires: Date.now() + MEM_TTL });
-        return { kind, buffer, remote: true };
+        try {
+            const timeout = Math.max(3000, Math.min(FETCH_TIMEOUT, deadline - Date.now()));
+            return await fetchRemote(src, timeout);
+        } catch (e) {
+            failed.set(src, Date.now() + FAIL_TTL);
+            throw e;
+        }
     }
 
     const file = path.isAbsolute(src) ? src : path.join(process.cwd(), src);
     const buffer = fs.readFileSync(file);
     const kind = sniff(buffer);
     if (!kind) throw new Error('not a picture or video');
-    return { kind, buffer, remote: false };
+    return { kind, buffer };
 }
 
 function candidates(imageOnly) {
@@ -97,9 +129,6 @@ async function pickMenuMedia(skipSrc, imageOnly) {
             const media = await loadSource(src, deadline);
             if (imageOnly && media.kind !== 'image') throw new Error('video skipped');
             if (media.kind === 'video' && media.buffer.length > MAX_VIDEO_BYTES) throw new Error('video too large');
-            if (media.remote && media.kind === 'image' && media.buffer.length < 5 * 1024 * 1024) {
-                try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(CACHE_FILE, media.buffer); } catch (_) { /* cache is optional */ }
-            }
             return { kind: media.kind, buffer: media.buffer, src };
         } catch (e) {
             console.error(`[MENU] picture skipped (${String(src).slice(0, 60)}): ${e.message}`);
@@ -107,6 +136,13 @@ async function pickMenuMedia(skipSrc, imageOnly) {
     }
     return null;
 }
+
+// Download every menu picture shortly after the bot starts, so the first .menu is already instant
+setTimeout(() => {
+    const deadline = Date.now() + 20000;
+    Promise.all(candidates(false).filter(src => /^https?:\/\//i.test(src)).map(src => loadSource(src, deadline).catch(() => {})))
+        .catch(() => {});
+}, 2000);
 
 // Small copy of the picture for the preview card (sharp if the bot has it, otherwise the file itself)
 async function cardThumb(buffer) {
@@ -128,6 +164,7 @@ cmd({
     aliases: ['help', 'cmdlist', 'commands'],
     filename: __filename
 }, async (sock, m) => {
+    const t0 = Date.now();
     const prefix = global.BOT_PREFIX || '.';
 
     const now = new Date();
@@ -322,6 +359,7 @@ ${BOT}`.trim();
             for (const ctx of [contextInfo, null]) {
                 try {
                     await sendMedia(media, fullText, ctx);
+                    console.log(`[MENU] sent in ${Date.now() - t0}ms`);
                     return;
                 } catch (err) {
                     console.error('[MENU] picture send failed, trying a simpler one:', err.message);
@@ -343,7 +381,11 @@ ${BOT}`.trim();
         let card = null;
         try {
             const media = await pickMenuMedia(null, true);
-            const thumbnail = media && await cardThumb(media.buffer);
+            let thumbnail = media && thumbCache.get(media.src);
+            if (media && !thumbnail) {
+                thumbnail = await cardThumb(media.buffer);
+                if (thumbnail) thumbCache.set(media.src, thumbnail);
+            }
             if (thumbnail) {
                 card = {
                     title: (global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗨𝗟𝗧𝗜𝗗𝗘𝗩𝗜𝗖𝗘',
@@ -365,6 +407,7 @@ ${BOT}`.trim();
             for (const ctx of attempts) {
                 try {
                     await sock.sendMessage(m.from, { text: chunks[0], contextInfo: ctx }, { quoted: m.raw || m });
+                    console.log(`[MENU] sent in ${Date.now() - t0}ms`);
                     return sendRest(chunks.slice(1));
                 } catch (err) {
                     console.error('[MENU] card send failed, trying a simpler one:', err.message);
