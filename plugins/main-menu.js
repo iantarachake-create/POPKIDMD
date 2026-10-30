@@ -9,8 +9,9 @@ try { settings = require('../lib/settings'); } catch (_) { /* rotation list is o
 
 // WhatsApp rejects image captions that are too long. Anything that does not fit in the
 // picture's caption continues straight after it in the same style, so every command is listed.
-const MAX_CAPTION = 3000;
-const MAX_TEXT = 3800;
+const MAX_CAPTION = 3000;   // longest caption that stays on the picture itself
+const MAX_TEXT = 3800;      // only used if a menu is ever too big for one message
+const MAX_SINGLE = 20000;   // the whole menu goes out as ONE message up to this size (WhatsApp allows far more)
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const CACHE_FILE = path.join(DATA_DIR, 'menu-cache.jpg');     // last remote image that worked
@@ -66,12 +67,12 @@ async function loadSource(src, deadline) {
     return { kind, buffer, remote: false };
 }
 
-function candidates() {
+function candidates(imageOnly) {
     const shuffle = (a) => a.slice().sort(() => Math.random() - 0.5);
     const out = [];
     try {
         if (settings) {
-            shuffle(settings.list('menuVideos')).forEach(src => out.push(src));
+            if (!imageOnly) shuffle(settings.list('menuVideos')).forEach(src => out.push(src));
             shuffle(settings.list('menuImages')).forEach(src => out.push(src));
         }
     } catch (_) { /* ignore */ }
@@ -87,13 +88,14 @@ function candidates() {
  *   3. the last picture that downloaded successfully (cache)
  *   4. the picture bundled with the bot (data/menu-default.jpg)
  */
-async function pickMenuMedia(skipSrc) {
+async function pickMenuMedia(skipSrc, imageOnly) {
     const deadline = Date.now() + BUDGET_MS;
-    for (const src of candidates()) {
+    for (const src of candidates(imageOnly)) {
         if (src === skipSrc) continue;
         if (Date.now() > deadline && src !== DEFAULT_FILE) continue;
         try {
             const media = await loadSource(src, deadline);
+            if (imageOnly && media.kind !== 'image') throw new Error('video skipped');
             if (media.kind === 'video' && media.buffer.length > MAX_VIDEO_BYTES) throw new Error('video too large');
             if (media.remote && media.kind === 'image' && media.buffer.length < 5 * 1024 * 1024) {
                 try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(CACHE_FILE, media.buffer); } catch (_) { /* cache is optional */ }
@@ -104,6 +106,16 @@ async function pickMenuMedia(skipSrc) {
         }
     }
     return null;
+}
+
+// Small copy of the picture for the preview card (sharp if the bot has it, otherwise the file itself)
+async function cardThumb(buffer) {
+    try {
+        const sharp = require('sharp');
+        return await sharp(buffer).resize({ width: 640, withoutEnlargement: true }).jpeg({ quality: 72 }).toBuffer();
+    } catch (_) {
+        return buffer.length < 300 * 1024 ? buffer : null;
+    }
 }
 
 // ---------- the command ----------
@@ -285,53 +297,86 @@ ${BOT}`.trim();
         return sock.sendMessage(m.from, content, opts);
     };
 
+    // The whole menu as one piece of text
+    const fullText = `${[headerText, ...blocks].join('\n\n')}\n\n${footer}`;
+
+    // Only if a menu were ever bigger than one message could hold does it continue in a second one
+    const chunks = (() => {
+        if (fullText.length <= MAX_SINGLE) return [fullText];
+        const { caption, rest } = compose(MAX_TEXT);
+        return [caption, ...rest];
+    })();
+
     // menu style 2 = text only
     if (menuStyle === 2) {
-        const { caption, rest } = compose(MAX_TEXT);
-        await m.reply(caption);
-        return sendRest(rest);
+        await m.reply(chunks[0]);
+        return sendRest(chunks.slice(1));
     }
 
-    // Try the picture, and if WhatsApp refuses it step down gently instead of giving up:
-    //   full caption + channel header -> full caption -> short caption -> bundled picture -> plain text
-    let media = null;
-    try { media = await pickMenuMedia(); } catch (e) { console.error('[MENU] picture error:', e.message); }
+    // 1) The menu fits in a caption (e.g. menu style 3): ONE message, the picture/video with the list under it
+    if (fullText.length <= MAX_CAPTION) {
+        let media = null;
+        try { media = await pickMenuMedia(); } catch (e) { console.error('[MENU] picture error:', e.message); }
 
-    if (media) {
-        const full = compose(MAX_CAPTION);
-        const short = compose(0);
-        const steps = [
-            { media, ...full, ctx: contextInfo },
-            { media, ...full, ctx: null },
-            { media, ...short, ctx: null }
-        ];
-
-        for (const step of steps) {
-            try {
-                await sendMedia(step.media, step.caption, step.ctx);
-                return sendRest(step.rest);
+        if (media) {
+            for (const ctx of [contextInfo, null]) {
+                try {
+                    await sendMedia(media, fullText, ctx);
+                    return;
+                } catch (err) {
+                    console.error('[MENU] picture send failed, trying a simpler one:', err.message);
+                }
+            }
+            try { // the chosen file itself may be the problem: use another picture
+                const fallback = await pickMenuMedia(media.src, true);
+                if (fallback) {
+                    await sendMedia(fallback, fullText, null);
+                    return;
+                }
             } catch (err) {
-                console.error('[MENU] picture send failed, trying a simpler one:', err.message);
+                console.error('[MENU] fallback picture failed:', err.message);
             }
         }
-
-        // the chosen file itself may be the problem: use the bundled picture
+    } else {
+        // 2) A long menu: ONE message. The text carries every command and the picture sits on top of it
+        //    as a large preview card, so nothing is split and nothing is cut off.
+        let card = null;
         try {
-            const fallback = await pickMenuMedia(media.src);
-            if (fallback) {
-                await sendMedia(fallback, short.caption, null);
-                return sendRest(short.rest);
+            const media = await pickMenuMedia(null, true);
+            const thumbnail = media && await cardThumb(media.buffer);
+            if (thumbnail) {
+                card = {
+                    title: (global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗨𝗟𝗧𝗜𝗗𝗘𝗩𝗜𝗖𝗘',
+                    body: `ᴏᴡɴᴇʀ : ${botOwner}  •  ᴘʀᴇғɪx : [ ${prefix} ]`,
+                    thumbnail,
+                    sourceUrl: global.menuSourceUrl || 'https://popkid.xyz',
+                    mediaType: 1,
+                    renderLargerThumbnail: true,
+                    showAdAttribution: false
+                };
             }
-        } catch (err) {
-            console.error('[MENU] bundled picture failed:', err.message);
+        } catch (e) { console.error('[MENU] picture error:', e.message); }
+
+        if (card) {
+            const attempts = [
+                { ...contextInfo, externalAdReply: card },   // card + channel header
+                { externalAdReply: card }                    // card only
+            ];
+            for (const ctx of attempts) {
+                try {
+                    await sock.sendMessage(m.from, { text: chunks[0], contextInfo: ctx }, { quoted: m.raw || m });
+                    return sendRest(chunks.slice(1));
+                } catch (err) {
+                    console.error('[MENU] card send failed, trying a simpler one:', err.message);
+                }
+            }
         }
     }
 
-    // last resort: the whole menu as text
+    // last resort: the whole menu as plain text
     try {
-        const { caption, rest } = compose(MAX_TEXT);
-        await m.reply(caption);
-        await sendRest(rest);
+        await m.reply(chunks[0]);
+        await sendRest(chunks.slice(1));
     } catch (err2) {
         console.error('[MENU] text error:', err2.message);
     }
