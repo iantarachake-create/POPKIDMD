@@ -517,6 +517,45 @@ function startBot() {
                 browser: ['Bot', 'Chrome', '1.0.0']
             });
 
+            // ---- Global "View channel" tag --------------------------------
+            // Wraps sock.sendMessage once so EVERY reply (m.reply, m.send,
+            // sock.sendMessage inside any plugin) shows "Forwarded many times
+            // + View channel". Commands that already set their own
+            // forwardedNewsletterMessageInfo are left untouched.
+            if (!sock.__channelTagPatched) {
+                const rawSend = sock.sendMessage.bind(sock);
+                const TAGGABLE = ['text', 'image', 'video', 'audio', 'document'];
+                sock.sendMessage = (jid, content, options) => {
+                    try {
+                        if (
+                            global.channelTag !== false &&
+                            content && typeof content === 'object' &&
+                            typeof jid === 'string' &&
+                            !jid.endsWith('@newsletter') && jid !== 'status@broadcast' &&
+                            !content.edit && !content.react && !content.delete && !content.forward &&
+                            TAGGABLE.some(k => content[k] !== undefined) &&
+                            !content.contextInfo?.forwardedNewsletterMessageInfo
+                        ) {
+                            content = {
+                                ...content,
+                                contextInfo: {
+                                    ...(content.contextInfo || {}),
+                                    forwardingScore: 999,
+                                    isForwarded: true,
+                                    forwardedNewsletterMessageInfo: {
+                                        newsletterJid: global.channelJid || '120363426692424154@newsletter',
+                                        newsletterName: global.channelName || 'Popkid',
+                                        serverMessageId: -1
+                                    }
+                                }
+                            };
+                        }
+                    } catch {}
+                    return rawSend(jid, content, options);
+                };
+                sock.__channelTagPatched = true;
+            }
+
             sock.ev.on('connection.update', async (update) => {
                 const { connection, lastDisconnect, qr } = update;
 
