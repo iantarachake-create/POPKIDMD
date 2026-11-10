@@ -295,23 +295,28 @@ const API_PROVIDERS = [
     ['qasimdev', async (u) => pickMedia((await getJson(`https://api.qasimdev.dpdns.org/api/loaderto/download?${new URLSearchParams({ apiKey: QASIM_KEY, format: 'mp3', url: u })}`))?.data)]
 ];
 
-async function viaApis(url, kind) {
+// only = list of provider names to try (or null = every provider except the ones in `skip`)
+async function viaApis(url, kind, only = null, attempts = 1, skip = []) {
     if (kind !== 'audio') throw new Error('no API fallback for video');
+    const list = API_PROVIDERS.filter(([n]) => (only ? only.includes(n) : !skip.includes(n)));
     const errs = [];
-    for (const [name, get] of API_PROVIDERS) {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popkid-play-'));
-        try {
-            const media = await get(url);
-            if (!media?.link) throw new Error('no media link');
-            const file = path.join(dir, 'audio.mp3');
-            await fetchTo(media.link, file, { Referer: 'https://ellytube.web.id/' });
-            const head = fs.readFileSync(file).subarray(0, 64).toString('utf8').toLowerCase();
-            if (head.includes('<!doctype') || head.includes('<html')) throw new Error('got a web page instead of audio');
-            return { file, dir, via: 'api:' + name, title: media.title };
-        } catch (e) {
-            rm(dir);
-            if (e.final) throw e;
-            errs.push(`${name}: ${shortErr(e)}`);
+    for (const [name, get] of list) {
+        for (let i = 1; i <= attempts; i++) {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popkid-play-'));
+            try {
+                const media = await get(url);
+                if (!media?.link) throw new Error('no media link');
+                const file = path.join(dir, 'audio.mp3');
+                await fetchTo(media.link, file, { Referer: 'https://ellytube.web.id/' });
+                const head = fs.readFileSync(file).subarray(0, 64).toString('utf8').toLowerCase();
+                if (head.includes('<!doctype') || head.includes('<html')) throw new Error('got a web page instead of audio');
+                return { file, dir, via: 'api:' + name, title: media.title };
+            } catch (e) {
+                rm(dir);
+                if (e.final) throw e;
+                if (i === attempts) errs.push(`${name}: ${shortErr(e)}`);
+                else await new Promise(r => setTimeout(r, 3000));
+            }
         }
     }
     throw new Error(errs.join('; '));
@@ -355,13 +360,16 @@ let ytdlpUpdated = false;
 
 async function download(id, kind) {
     const url = `https://www.youtube.com/watch?v=${id}`;
-    const routes = [
+    // On hosts where YouTube blocks the IP, the API is the route that works, so audio tries it first.
+    const routes = [];
+    if (kind === 'audio') routes.push(['qasim api', () => viaApis(url, kind, ['qasimdev'], 2)]);
+    routes.push(
         ['yt-dlp', () => viaYtdlp(url, kind)],
         ['yt-dlp tv', () => viaYtdlp(url, kind, ['--extractor-args', 'youtube:player_client=tv_embedded'], 'yt-dlp tv')],
         ['yt-dlp embedded', () => viaYtdlp(url, kind, ['--extractor-args', 'youtube:player_client=web_embedded'], 'yt-dlp embedded')],
-        ['invidious', () => viaInvidious(id, kind)],
-        ['api', () => viaApis(url, kind)]
-    ];
+        ['invidious', () => viaInvidious(id, kind)]
+    );
+    if (kind === 'audio') routes.push(['other apis', () => viaApis(url, kind, null, 1, ['qasimdev'])]);
     const errors = [];
     for (const [name, fn] of routes) {
         try {
