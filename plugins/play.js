@@ -175,8 +175,8 @@ async function invTry(fn) {
     throw last || new Error('No Invidious instance responded');
 }
 
-async function fetchTo(url, file) {
-    const r = await fetch(url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(240000) });
+async function fetchTo(url, file, headers = {}) {
+    const r = await fetch(url, { headers: { 'user-agent': UA, ...headers }, signal: AbortSignal.timeout(240000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const limit = MAX_MB * 1048576;
     if ((+r.headers.get('content-length') || 0) > limit) throw finalError(`File is bigger than ${MAX_MB}MB.`);
@@ -248,6 +248,75 @@ async function invidiousSearch(q) {
     });
 }
 
+/* ───────────────────────────── download-API fallback (audio only) ─────────────────────────────
+ * Last resort when the host's IP is blocked by YouTube (common on Heroku/Render/etc).
+ * Same services your previous play.js used. Override keys with env vars if you have your own.
+ */
+const RYUU_KEY = process.env.RYUU_API_KEY || 'ryuu-apis-9c049100c28fc39e1791732697814';
+const ELLYTUBE_KEY = process.env.ELLYTUBE_API_KEY || 'Agustus2026';
+const SIDY_KEY = process.env.SIDY_API_KEY || 'memberdycoders';
+const QASIM_KEY = process.env.QASIM_API_KEY || 'xbps-install-Syu';
+
+// APIs nest the link in different places, so look through every layer
+const pickMedia = (data) => {
+    if (!data || typeof data !== 'object') return null;
+    const layers = [data?.result?.result, data?.result?.data, data?.data?.result, data?.result, data?.data, data];
+    for (const layer of layers) {
+        if (!layer || typeof layer !== 'object') continue;
+        const link = layer.link || layer.url || layer.download || layer.downloadUrl || layer.download_url
+            || layer.cdn || layer.media || layer.audio || layer.mp3 || layer.file?.url;
+        if (link && typeof link === 'string' && /^https?:\/\//i.test(link)) {
+            return { link, title: layer.title || data?.result?.title || data?.title };
+        }
+    }
+    return null;
+};
+
+async function getJson(url, headers = {}, timeout = 90000) {
+    const r = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA, ...headers }, signal: AbortSignal.timeout(timeout) });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(`invalid JSON (HTTP ${r.status})`); }
+    if (r.status === 401) throw new Error('API key invalid');
+    if (r.status === 429) throw new Error('rate limited');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return data;
+}
+
+const API_PROVIDERS = [
+    ['ellytube', async (u) => pickMedia(await getJson(`https://ellytube.web.id/api/v1/youtube/download?${new URLSearchParams({ url: u, type: 'audio', quality: '320kbps', apikey: ELLYTUBE_KEY })}`))],
+    ['apiziaul', async (u) => pickMedia(await getJson(`https://apiziaul.vercel.app/api/downloader/ytmp3?url=${encodeURIComponent(u)}`))],
+    ['ryuu', async (u) => pickMedia(await getJson(`https://api.ryuu-dev.my.id/downloader/youtube?url=${encodeURIComponent(u)}&format=mp3`, { 'X-RYUU-APIKEY': RYUU_KEY }))],
+    ['sidycoders', async (u) => {
+        const d = await getJson(`https://api.sidycoders.xyz/api/ytdl?url=${encodeURIComponent(u)}&format=mp3&apikey=${SIDY_KEY}`, {}, 60000);
+        const link = d?.cdn || d?.result?.cdn || d?.url;
+        return link ? { link, title: d?.title || d?.result?.title } : null;
+    }],
+    ['qasimdev', async (u) => pickMedia((await getJson(`https://api.qasimdev.dpdns.org/api/loaderto/download?${new URLSearchParams({ apiKey: QASIM_KEY, format: 'mp3', url: u })}`))?.data)]
+];
+
+async function viaApis(url, kind) {
+    if (kind !== 'audio') throw new Error('no API fallback for video');
+    const errs = [];
+    for (const [name, get] of API_PROVIDERS) {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popkid-play-'));
+        try {
+            const media = await get(url);
+            if (!media?.link) throw new Error('no media link');
+            const file = path.join(dir, 'audio.mp3');
+            await fetchTo(media.link, file, { Referer: 'https://ellytube.web.id/' });
+            const head = fs.readFileSync(file).subarray(0, 64).toString('utf8').toLowerCase();
+            if (head.includes('<!doctype') || head.includes('<html')) throw new Error('got a web page instead of audio');
+            return { file, dir, via: 'api:' + name, title: media.title };
+        } catch (e) {
+            rm(dir);
+            if (e.final) throw e;
+            errs.push(`${name}: ${shortErr(e)}`);
+        }
+    }
+    throw new Error(errs.join('; '));
+}
+
 /* ───────────────────────────── search + metadata ───────────────────────────── */
 async function findVideo(query) {
     const q = String(query).trim();
@@ -290,7 +359,8 @@ async function download(id, kind) {
         ['yt-dlp', () => viaYtdlp(url, kind)],
         ['yt-dlp tv', () => viaYtdlp(url, kind, ['--extractor-args', 'youtube:player_client=tv_embedded'], 'yt-dlp tv')],
         ['yt-dlp embedded', () => viaYtdlp(url, kind, ['--extractor-args', 'youtube:player_client=web_embedded'], 'yt-dlp embedded')],
-        ['invidious', () => viaInvidious(id, kind)]
+        ['invidious', () => viaInvidious(id, kind)],
+        ['api', () => viaApis(url, kind)]
     ];
     const errors = [];
     for (const [name, fn] of routes) {
@@ -307,7 +377,7 @@ async function download(id, kind) {
         }
     }
     console.error('[PLAY] all routes failed:', errors.join(' | '));
-    throw new Error('YouTube blocked every download route right now. Try again in a minute or pick another song.');
+    throw Object.assign(new Error('Every download route failed right now. Try again in a minute or pick another song.'), { routes: errors });
 }
 
 async function withSlot(fn) {
@@ -345,7 +415,8 @@ async function fetchAndSend(m, id, title, kind) {
 
 function fail(m, err, title = '❌ *𝗣𝗟𝗔𝗬 𝗘𝗥𝗥𝗢𝗥*') {
     console.error('[PLAY] Error:', err.message);
-    return m.react('❌').catch(() => {}).then(() => m.reply(box(title, `➽ ${err.message}`)));
+    const why = (m.isOwner || m.isDev) && err.routes?.length ? ['', '*Debug (owner only):*', ...err.routes.map(r => `➽ ${r.slice(0, 200)}`)] : [];
+    return m.react('❌').catch(() => {}).then(() => m.reply(box(title, `➽ ${err.message}`, ...why)));
 }
 
 const getQuery = (m, args) => (args?.length ? args.join(' ').trim() : (m.quoted?.body || '').trim());
