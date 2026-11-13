@@ -309,7 +309,7 @@ ${BOT}`.trim();
         for (const text of rest) {
             try {
                 await new Promise(r => setTimeout(r, 500));
-                await m.reply(text);
+                await sock.sendMessage(m.from, { text }, { quoted: m.raw, keepQuote: true });
             } catch (err) {
                 console.error('[MENU] text part failed:', err.message);
             }
@@ -332,7 +332,7 @@ ${BOT}`.trim();
             ? { video: media.buffer, gifPlayback: true, caption }
             : { image: media.buffer, caption };
         if (ctx) content.contextInfo = ctx;
-        return sock.sendMessage(m.from, content, { quoted: m.raw });
+        return sock.sendMessage(m.from, content, { quoted: m.raw, keepQuote: true });
     };
 
     // The whole menu as one piece of text; it only continues in a second message if it is bigger than MAX_SINGLE
@@ -400,7 +400,7 @@ ${BOT}`.trim();
                 ['card', { externalAdReply: card }]
             ];
             for (const [label, ctx] of ways) {
-                if (await attempt(label, () => sock.sendMessage(m.from, { text: chunks[0], contextInfo: ctx }, { quoted: m.raw }))) {
+                if (await attempt(label, () => sock.sendMessage(m.from, { text: chunks[0], contextInfo: ctx }, { quoted: m.raw, keepQuote: true }))) {
                     return sendRest(chunks.slice(1));
                 }
             }
@@ -409,7 +409,7 @@ ${BOT}`.trim();
 
     // Way 3 (also menu style 2): the whole menu as plain text, always works
     try {
-        await m.reply(chunks[0]);
+        await sock.sendMessage(m.from, { text: chunks[0] }, { quoted: m.raw, keepQuote: true });
         await sendRest(chunks.slice(1));
         console.log(`[MENU] sent (text) in ${Date.now() - t0}ms`);
     } catch (err) {
