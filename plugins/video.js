@@ -1,13 +1,12 @@
-const axios = require('axios');
 const yts = require('yt-search');
 const { cmd } = require('../arslan');
+const APIs = require('../lib/api');
+const { fetchWhatsAppVideo } = require('../lib/waVideo');
 
-const YTMP4_API = 'https://api.delirius.online/download/ytmp4';
 const YT_ID_REGEX = /(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:\S*&)?v=|shorts\/|embed\/|v\/|live\/))([\w-]{11})/i;
 const DEFAULT_QUALITY = '360p';
 const QUALITIES = ['144p', '240p', '360p', '480p', '720p', '1080p'];
 const MAX_SECONDS = 20 * 60;          // refuse anything longer than 20 minutes
-const MAX_BYTES = 100 * 1024 * 1024;  // 100MB download cap (fallback path)
 const PENDING_TTL = 10 * 60 * 1000;   // menu stays active for 10 minutes
 
 const TITLE = '┏▣ ◈ *𝗣𝗢𝗣𝗞𝗜𝗗 𝗩𝗜𝗗𝗘𝗢* ◈';
@@ -67,49 +66,32 @@ async function resolveVideo(query) {
     return v;
 }
 
-async function requestMp4(videoUrl, format, retries) {
-    let lastErr;
-    for (let i = 0; i <= retries; i++) {
-        try {
-            const { data } = await axios.get(YTMP4_API, {
-                params: { url: videoUrl, format },
-                timeout: 120000
-            });
+// Download sources, tried in order (first success wins) - from lib/api.js
+async function fetchMp4(videoUrl, quality) {
+    const q = quality.replace(/p$/i, '');
+    const steps = [
+        ['Knight', () => APIs.knightVideoDownload(videoUrl, quality)],
+        ['Prince', () => APIs.princeVideoDownload(videoUrl, q)],
+        ['Hector', () => APIs.hectorVideoDownload(videoUrl, q)],
+        ['EliteProTech', () => APIs.getEliteProTechVideoByUrl(videoUrl)],
+        ['Yupra', () => APIs.getYupraVideoByUrl(videoUrl)],
+        ['Okatsu', () => APIs.getOkatsuVideoByUrl(videoUrl)]
+    ];
 
-            const link = data?.data?.download;
-            if (!data?.status || !link || !/^https?:\/\//i.test(link)) {
-                throw new Error('Download link not available for this video');
-            }
-            return data.data;
+    let lastErr;
+    for (const [name, run] of steps) {
+        try {
+            const result = await run();
+            const download = result.download || result.dl_url || result.dl;
+            if (!download || !/^https?:\/\//i.test(download)) throw new Error('No download URL');
+            console.log(`[VIDEO] OK via ${name}`);
+            return { title: result.title, download, quality };
         } catch (err) {
             lastErr = err;
-            if (i < retries) await wait(3000);
+            console.log(`[VIDEO] ${name} failed:`, err?.message || err);
         }
     }
-    throw lastErr;
-}
-
-// Try the wanted quality first, then fall back to 360p
-async function fetchMp4(videoUrl, quality) {
-    try {
-        const data = await requestMp4(videoUrl, quality, quality === DEFAULT_QUALITY ? 2 : 1);
-        return { ...data, quality };
-    } catch (err) {
-        if (quality === DEFAULT_QUALITY) throw err;
-        const data = await requestMp4(videoUrl, DEFAULT_QUALITY, 1);
-        return { ...data, quality: DEFAULT_QUALITY };
-    }
-}
-
-async function getBuffer(url) {
-    const res = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: 300000,
-        maxContentLength: MAX_BYTES,
-        maxBodyLength: MAX_BYTES,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' }
-    });
-    return Buffer.from(res.data);
+    throw lastErr || new Error('All download sources failed');
 }
 
 // Send the video in the chosen format
@@ -121,14 +103,9 @@ async function deliver(m, choice, mp4, title) {
         ? { document: source, mimetype: 'video/mp4', fileName, caption }
         : { video: source, mimetype: 'video/mp4', caption };
 
-    try {
-        // Fast path: let WhatsApp pull straight from the URL
-        return await m.reply(build({ url: mp4.download }));
-    } catch (e) {
-        // Fallback: download to a buffer first, then upload
-        const buffer = await getBuffer(mp4.download);
-        return await m.reply(build(buffer));
-    }
+    // Download, then remux/convert to a WhatsApp-friendly MP4 (lib/waVideo.js)
+    const buffer = await fetchWhatsAppVideo(mp4.download);
+    return await m.reply(build(buffer));
 }
 
 const registered = cmd({
