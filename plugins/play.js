@@ -284,6 +284,16 @@ async function getJson(url, headers = {}, timeout = 90000) {
 }
 
 const API_PROVIDERS = [
+    // Keith + Hector (from the play2 script) - they return the link as a plain string
+    ['keith', async (u) => {
+        const d = await getJson(`https://apiskeith2-production-ec66.up.railway.app/download/audio?url=${encodeURIComponent(u)}`, {}, 60000);
+        const link = typeof d?.result === 'string' ? d.result : (d?.result?.url || d?.result?.download);
+        return d?.status && link ? { link, title: d.title || d?.result?.title } : null;
+    }],
+    ['hector', async (u) => {
+        const d = await getJson(`https://yt-dl.officialhectormanuel.workers.dev/?url=${encodeURIComponent(u)}`, {}, 60000);
+        return d?.status && d?.audio ? { link: d.audio, title: d.title } : null;
+    }],
     ['ellytube', async (u) => pickMedia(await getJson(`https://ellytube.web.id/api/v1/youtube/download?${new URLSearchParams({ url: u, type: 'audio', quality: '320kbps', apikey: ELLYTUBE_KEY })}`))],
     ['apiziaul', async (u) => pickMedia(await getJson(`https://apiziaul.vercel.app/api/downloader/ytmp3?url=${encodeURIComponent(u)}`))],
     ['ryuu', async (u) => pickMedia(await getJson(`https://api.ryuu-dev.my.id/downloader/youtube?url=${encodeURIComponent(u)}&format=mp3`, { 'X-RYUU-APIKEY': RYUU_KEY }))],
@@ -362,6 +372,7 @@ async function download(id, kind) {
     const url = `https://www.youtube.com/watch?v=${id}`;
     // On hosts where YouTube blocks the IP, the API is the route that works, so audio tries it first.
     const routes = [];
+    if (kind === 'audio') routes.push(['keith/hector api', () => viaApis(url, kind, ['keith', 'hector'], 2)]);
     if (kind === 'audio') routes.push(['qasim api', () => viaApis(url, kind, ['qasimdev'], 2)]);
     routes.push(
         ['yt-dlp', () => viaYtdlp(url, kind)],
@@ -369,7 +380,7 @@ async function download(id, kind) {
         ['yt-dlp embedded', () => viaYtdlp(url, kind, ['--extractor-args', 'youtube:player_client=web_embedded'], 'yt-dlp embedded')],
         ['invidious', () => viaInvidious(id, kind)]
     );
-    if (kind === 'audio') routes.push(['other apis', () => viaApis(url, kind, null, 1, ['qasimdev'])]);
+    if (kind === 'audio') routes.push(['other apis', () => viaApis(url, kind, null, 1, ['qasimdev', 'keith', 'hector'])]);
     const errors = [];
     for (const [name, fn] of routes) {
         try {
