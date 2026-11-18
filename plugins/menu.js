@@ -1,60 +1,217 @@
 'use strict';
 /**
- * Simple POPKID menu: one text reply, built automatically from the loaded commands.
- *   .menu             every command, grouped by category
- *   .menu <category>  just that category
+ * POPKID MENU — vertical box menu, built automatically from the loaded commands.
+ *
+ *   .menu             every command, one box per category
+ *   .menu <category>  only that category   (e.g. .menu admin, .menu downloads)
+ *
+ * No links anywhere. The picture (optional) is a LOCAL file, never a URL.
  */
+const fs = require('fs');
+const path = require('path');
 const { cmd } = require('../arslan');
 
-const ORDER = ['general', 'info', 'downloads', 'search', 'ai', 'tools', 'ephoto360', 'fun', 'sports', 'group', 'status', 'channel', 'admin', 'owner', 'settings'];
-const ALIAS = { downloader: 'downloads', downloaders: 'downloads', download: 'downloads', tool: 'tools', utility: 'tools' };
+// Set to true to send a picture banner (header) before the list.
+// Local files only: the picture set with .setmenuimg, or data/menu-default.jpg.
+const USE_PICTURE = false;
 
-const key = (s) => {
+const MAX_MSG = 3800;   // longest single message; the list is split on box edges
+
+/* ───────────── categories ───────────── */
+const CATS = {
+    general:   ['🏠', 'GENERAL'],
+    info:      ['ℹ️', 'INFO'],
+    downloads: ['📥', 'DOWNLOADS'],
+    search:    ['🔍', 'SEARCH'],
+    ai:        ['🤖', 'AI'],
+    tools:     ['🛠️', 'TOOLS'],
+    ephoto360: ['🎨', 'LOGO MAKER'],
+    fun:       ['🎉', 'FUN'],
+    sports:    ['⚽', 'SPORTS'],
+    group:     ['👥', 'GROUP'],
+    status:    ['📡', 'STATUS'],
+    channel:   ['📢', 'CHANNEL'],
+    admin:     ['🛡️', 'ADMIN'],
+    owner:     ['👑', 'OWNER'],
+    settings:  ['⚙️', 'SETTINGS']
+};
+const ORDER = Object.keys(CATS);
+const SAME = {
+    download: 'downloads', downloader: 'downloads', downloaders: 'downloads', dl: 'downloads',
+    tool: 'tools', utility: 'tools', utilities: 'tools',
+    logo: 'ephoto360', logos: 'ephoto360', ephoto: 'ephoto360', textpro: 'ephoto360',
+    game: 'fun', games: 'fun', groups: 'group', misc: 'general', main: 'general'
+};
+const keyOf = (s) => {
     const k = String(s || 'general').toLowerCase().replace(/[^a-z0-9]/g, '') || 'general';
-    return ALIAS[k] || k;
+    return SAME[k] || k;
 };
 
+/* Commands answered directly by index.js (they never call cmd(), so they are listed here). */
+const NATIVE = [
+    ['warn', 'admin'], ['resetwarn', 'admin'],
+    ['anticall', 'owner'], ['antispam', 'owner'], ['broadcast', 'owner'], ['backup', 'owner'], ['restore', 'owner']
+];
+
+/* ───────────── small helpers ───────────── */
+const SMALL = { a: 'ᴀ', b: 'ʙ', c: 'ᴄ', d: 'ᴅ', e: 'ᴇ', f: 'ғ', g: 'ɢ', h: 'ʜ', i: 'ɪ', j: 'ᴊ', k: 'ᴋ', l: 'ʟ', m: 'ᴍ', n: 'ɴ', o: 'ᴏ', p: 'ᴘ', q: 'ǫ', r: 'ʀ', s: 's', t: 'ᴛ', u: 'ᴜ', v: 'ᴠ', w: 'ᴡ', x: 'x', y: 'ʏ', z: 'ᴢ' };
+const sc = (s) => String(s).toLowerCase().split('').map(c => SMALL[c] || c).join('');
+
+function clock() {
+    const tz = global.timezone || 'Africa/Nairobi';
+    const now = new Date();
+    try {
+        return {
+            date: now.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric', timeZone: tz }),
+            time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: tz }),
+            hour: Number(new Intl.DateTimeFormat('en-GB', { hour: 'numeric', hour12: false, timeZone: tz }).format(now)) % 24
+        };
+    } catch {
+        return { date: now.toDateString(), time: now.toLocaleTimeString(), hour: now.getHours() };
+    }
+}
+
+const greet = (h) => h >= 5 && h < 12 ? '🌅 Good morning' : h < 17 && h >= 12 ? '☀️ Good afternoon' : h >= 17 && h < 21 ? '🌇 Good evening' : '🌙 Good night';
+
+function uptimeText() {
+    const s = Math.floor(process.uptime());
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    return `${d ? d + 'd ' : ''}${h}h ${m}m`;
+}
+
+/* ───────────── read the loaded commands ───────────── */
+function collect() {
+    const groups = {};
+    const seen = new Set();
+    const add = (name, label) => {
+        if (seen.has(name)) return;
+        seen.add(name);
+        const k = (global.settingsMenuNames && global.settingsMenuNames.has(name)) ? 'settings' : keyOf(label);
+        (groups[k] = groups[k] || []).push(name);
+    };
+
+    let disabled = [];
+    try { disabled = require('../lib/settings').list('disabled'); } catch { /* optional */ }
+
+    for (const p of (global.plugins instanceof Map ? global.plugins.values() : [])) {
+        if (!p || !p.name || p.hidden || p.name.startsWith('__') || disabled.includes(p.name)) continue;
+        add(p.name, p.category);
+    }
+    for (const [name, cat] of NATIVE) if (!disabled.includes(name)) add(name, cat);
+
+    const keys = [...ORDER.filter(k => groups[k]), ...Object.keys(groups).filter(k => !ORDER.includes(k)).sort()];
+    return { groups, keys, total: seen.size };
+}
+
+/* ───────────── building the text ───────────── */
+const LINE = '══════════════════⊷';
+
+function headerBox(m, total, categories) {
+    const c = clock();
+    const mode = global.botMode === 'private' ? 'Private' : 'Public';
+    const ram = (process.memoryUsage().rss / 1048576).toFixed(0);
+    return [
+        `╭${LINE}`,
+        `║   ✨ *${'𝗣𝗢𝗣𝗞𝗜𝗗-𝗠𝗗'}* ✨`,
+        `╠${LINE}`,
+        `║ ${greet(c.hour)}, *${m.pushName || 'User'}*`,
+        `╠${LINE}`,
+        `║ 👑 *${sc('owner')}:* ${global.ownerName || 'POPKID'}`,
+        `║ 🚀 *${sc('commands')}:* ${total}`,
+        `║ 📂 *${sc('categories')}:* ${categories}`,
+        `║ 🔑 *${sc('prefix')}:* [ ${global.BOT_PREFIX || '.'} ]`,
+        `║ 🌐 *${sc('mode')}:* ${mode}`,
+        `║ ⏳ *${sc('uptime')}:* ${uptimeText()}`,
+        `║ 📅 *${sc('date')}:* ${c.date}`,
+        `║ ⌚ *${sc('time')}:* ${c.time}`,
+        `║ 📊 *${sc('ram')}:* ${ram}ᴍʙ`,
+        `╰${LINE}`
+    ].join('\n');
+}
+
+function categoryBox(key, names) {
+    const [emoji, title] = CATS[key] || ['💠', key.toUpperCase()];
+    const p = global.BOT_PREFIX || '.';
+    return [
+        `╔${LINE}`,
+        `║ ${emoji}  *${title}*  ‹${names.length}›`,
+        `╠${LINE}`,
+        ...names.slice().sort().map(n => `║ ◈ ${p}${n}`),
+        `╚${LINE}`
+    ].join('\n');
+}
+
+/** join boxes into messages that stay under the size limit */
+function pack(blocks) {
+    const out = [];
+    let cur = '';
+    for (const b of blocks) {
+        if (cur && cur.length + 1 + b.length > MAX_MSG) { out.push(cur); cur = b; }
+        else cur = cur ? `${cur}\n${b}` : b;
+    }
+    if (cur) out.push(cur);
+    return out;
+}
+
+/** local picture only — never a link */
+function localPicture() {
+    const candidates = [global.menuImage, path.join(__dirname, '..', 'data', 'menu-image.jpg'), path.join(__dirname, '..', 'data', 'menu-default.jpg')];
+    for (const f of candidates) {
+        try {
+            if (f && !/^https?:\/\//i.test(f) && fs.existsSync(f)) return fs.readFileSync(f);
+        } catch { /* try the next one */ }
+    }
+    return null;
+}
+
+/* ───────────── the command ───────────── */
 cmd({
     pattern: 'menu',
     name: 'menu',
-    alias: ['help', 'commands', 'cmds'],
+    alias: ['help', 'list', 'commands', 'cmds'],
     category: 'General',
     desc: 'Show all commands',
     hidden: true,
     filename: __filename
 }, async (sock, m, args) => {
-    const p = global.BOT_PREFIX || '.';
+    try {
+        const { groups, keys, total } = collect();
+        const p = global.BOT_PREFIX || '.';
 
-    // collect every visible command, grouped by category
-    const groups = {};
-    const seen = new Set();
-    for (const plugin of (global.plugins instanceof Map ? global.plugins.values() : [])) {
-        if (!plugin || !plugin.name || plugin.hidden || plugin.name.startsWith('__') || seen.has(plugin.name)) continue;
-        seen.add(plugin.name);
-        const k = (global.settingsMenuNames && global.settingsMenuNames.has(plugin.name)) ? 'settings' : key(plugin.category);
-        (groups[k] = groups[k] || []).push(plugin.name);
+        // .menu <category>
+        const want = args[0] ? keyOf(args[0]) : null;
+        const shown = want ? keys.filter(k => k === want) : keys;
+        if (!shown.length) {
+            const list = keys.map(k => (CATS[k] ? CATS[k][1] : k.toUpperCase()).toLowerCase()).join(', ');
+            return m.reply(`❌ No category called *${args[0]}*\n\n📂 ${list}\n\nTry ${p}menu`);
+        }
+
+        const head = headerBox(m, total, keys.length);
+        const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
+        const boxes = shown.map(k => categoryBox(k, groups[k]));
+
+        // optional picture banner (header as caption), then the list
+        let blocks = [head, ...boxes];
+        if (USE_PICTURE && !want) {
+            const img = localPicture();
+            if (img) {
+                try {
+                    await m.reply({ image: img, caption: head });
+                    blocks = boxes;
+                } catch (err) {
+                    console.error('[MENU] picture failed, sending text only:', err.message);
+                }
+            }
+        }
+
+        const texts = pack(blocks);
+        texts[texts.length - 1] += `\n${footer}`;
+        for (let i = 0; i < texts.length; i++) {
+            if (i) await new Promise(r => setTimeout(r, 400));
+            await m.reply(texts[i]);
+        }
+    } catch (err) {
+        console.error('[MENU] error:', err);
+        await m.reply('❌ Could not build the menu.').catch(() => {});
     }
-
-    const want = args[0] ? key(args[0]) : null;
-    const cats = [...ORDER.filter(c => groups[c]), ...Object.keys(groups).filter(c => !ORDER.includes(c)).sort()]
-        .filter(c => !want || c === want);
-
-    if (!cats.length) return m.reply(`❌ No category "${args[0]}". Try ${p}menu`);
-
-    const up = process.uptime();
-    const header =
-        `┏▣ ◈ *𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗗* ◈\n` +
-        `┃ *ᴏᴡɴᴇʀ* : ${global.ownerName || 'POPKID'}\n` +
-        `┃ *ᴜsᴇʀ* : ${m.pushName || 'User'}\n` +
-        `┃ *ᴄᴏᴍᴍᴀɴᴅs* : ${seen.size}\n` +
-        `┃ *ᴜᴘᴛɪᴍᴇ* : ${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m\n` +
-        `┃ *ᴘʀᴇғɪx* : [ ${p} ]\n` +
-        `┗▣`;
-
-    const boxes = cats.map(c =>
-        `┏▣ ◈ *${c.toUpperCase()}* ◈\n` +
-        groups[c].sort().map(n => `┃➽ ${p}${n}`).join('\n') +
-        `\n┗▣`);
-
-    await m.reply([header, ...boxes].join('\n\n') + '\n\n*© 𝗣𝗢𝗣𝗞𝗜𝗗*');
 });
