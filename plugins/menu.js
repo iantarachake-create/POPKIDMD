@@ -5,16 +5,16 @@
  * Builds itself from the commands that are actually loaded, so a new plugin
  * shows up here the moment it calls cmd() — there is nothing to edit.
  *
- *   .menu                 picture + dashboard + every command, grouped by category
+ *   .menu                 one message: picture card + dashboard + every command by category
  *   .menu <category>      one category with a short description for each command
  *   .menu <command>       details of one command (aliases, category, usage)
  *   .menu all             the full list as plain text
  *   .<category>menu       shortcut, e.g. .adminmenu  .toolsmenu  .downloadsmenu
  *
  * Look is controlled by the existing owner setting:  .set menustyle 1|2|3
- *   1 = picture/video + full list (default)
+ *   1 = picture card + full list (default)
  *   2 = text only, full list
- *   3 = compact: picture/video + dashboard + category index only
+ *   3 = compact: picture card + dashboard + category index only
  *
  * Categories come from each command's `category:`. Spelling differences such as
  * "Downloader" / "Downloaders" / "tools" / "Tools" are merged; a category the
@@ -29,8 +29,8 @@ try { settings = require('../lib/settings'); } catch { /* optional */ }
 
 /* ───────────────────────── look & feel ───────────────────────── */
 
-const MAX_CAPTION = 3000;   // longest caption kept on the picture
-const MAX_TEXT = 3500;      // longest follow-up text message
+const MAX_TEXT = 3500;      // longest message for category views
+const MAX_SINGLE = 20000;   // the main menu goes out as ONE message up to this size
 const DENSE_OVER = 30;      // categories bigger than this are printed 3 per line in the full list
 
 const BOLD = (s) => String(s).split('').map(ch => {
@@ -340,61 +340,89 @@ const menuStyle = () => {
     return [1, 2, 3].includes(s) ? s : 1;
 };
 
+/** small copy of the picture for the preview card */
+const thumbCache = new Map();
+async function cardThumb(src, buffer) {
+    if (thumbCache.has(src)) return thumbCache.get(src);
+    let out = null;
+    try {
+        const sharp = require('sharp');
+        out = await sharp(buffer).resize({ width: 640, withoutEnlargement: true }).jpeg({ quality: 72 }).toBuffer();
+    } catch {
+        out = buffer.length < 300 * 1024 ? buffer : null;   // no sharp: use the file itself if it is small
+    }
+    if (out) {
+        if (thumbCache.size >= 10) thumbCache.delete(thumbCache.keys().next().value);
+        thumbCache.set(src, out);
+    }
+    return out;
+}
+
+/**
+ * The menu goes out as ONE text message with the picture shown on top as a large
+ * preview card (externalAdReply). Unlike a plain picture + caption, this is the
+ * form WhatsApp reliably delivers to every user, not just to the bot's own phone.
+ */
 async function sendMainMenu(sock, m, { forceText = false } = {}) {
     const data = collect();
     const send = makeSender(sock, m);
     const style = forceText ? 2 : menuStyle();
+    const end = footer();
 
     const head = header(m, data);
     const toc = index(data);
     const lists = data.cats.flatMap(listBlocks);
-    const end = footer();
 
     if (!data.total) return m.reply(`${head}\n\n_No commands are loaded yet._\n\n${end}`);
 
-    // style 2: text only
-    if (style === 2) {
-        const texts = pack([head, ...lists]);
-        texts[texts.length - 1] += `\n\n${end}`;
-        return sendTexts(send, texts);
-    }
+    const parts = style === 3 ? [head, toc] : style === 2 ? [head, ...lists] : [head, toc, ...lists];
+    const texts = pack(parts, MAX_SINGLE);
+    texts[texts.length - 1] += `\n\n${end}`;
 
-    // style 1 / 3: picture (or video) carries the dashboard + index
-    const opening = `${head}\n\n${toc}${style === 3 ? `\n\n${end}` : ''}`;
-    const followUps = style === 3 ? [] : pack(lists);
-    if (followUps.length) followUps[followUps.length - 1] += `\n\n${end}`;
+    // style 2 = text only
+    if (style === 2) return sendTexts(send, texts);
 
-    let sent = false;
-    if (opening.length <= MAX_CAPTION) {
-        let media = null;
-        try { media = await pickMenuMedia(); } catch (e) { console.error('[MENU] picture error:', e.message); }
+    // build the preview card from the menu picture
+    let card = null;
+    try {
+        const media = await pickMenuMedia(null, true);
+        const thumbnail = media && await cardThumb(media.src, media.buffer);
+        if (thumbnail) {
+            const botName = (global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗 𝗠𝗗';
+            card = {
+                title: botName,
+                body: `ᴏᴡɴᴇʀ : ${global.ownerName || 'POPKID'}  •  ᴘʀᴇғɪx : [ ${prefix()} ]`,
+                thumbnail,
+                sourceUrl: global.menuSourceUrl || 'https://popkid.xyz',
+                mediaType: 1,
+                renderLargerThumbnail: true,
+                showAdAttribution: false
+            };
+        }
+    } catch (e) { console.error('[MENU] picture error:', e.message); }
 
-        const attempt = async (pick) => {
-            const content = pick.kind === 'video'
-                ? { video: pick.buffer, gifPlayback: true, caption: opening }
-                : { image: pick.buffer, caption: opening };
-            await send(content);
+    if (card) {
+        const channel = {
+            forwardingScore: 999,
+            isForwarded: true,
+            forwardedNewsletterMessageInfo: {
+                newsletterJid: global.channelJid || '120363426692424154@newsletter',
+                newsletterName: global.channelName || 'Popkid',
+                serverMessageId: 1
+            }
         };
-
-        if (media) {
-            try { await attempt(media); sent = true; }
-            catch (err) {
-                console.error('[MENU] picture send failed, trying another:', err.message);
-                try {
-                    const other = await pickMenuMedia(media.src, true);
-                    if (other) { await attempt(other); sent = true; }
-                } catch (err2) { console.error('[MENU] fallback picture failed:', err2.message); }
+        for (const ctx of [{ ...channel, externalAdReply: card }, { externalAdReply: card }]) {
+            try {
+                await send({ text: texts[0], contextInfo: ctx });
+                return sendTexts(send, texts.slice(1));
+            } catch (err) {
+                console.error('[MENU] card send failed, trying a simpler one:', err.message);
             }
         }
     }
 
-    // no picture could be sent → the same content as plain text, nothing lost
-    if (!sent) return sendTexts(send, pack([head, toc, ...(style === 3 ? [] : lists)]).map((t, i, a) => i === a.length - 1 ? `${t}\n\n${end}` : t));
-
-    if (followUps.length) {
-        await pause(500);
-        await sendTexts(send, followUps);
-    }
+    // no picture / card refused → the same menu as plain text, nothing lost
+    return sendTexts(send, texts);
 }
 
 async function sendCategory(sock, m, key) {
