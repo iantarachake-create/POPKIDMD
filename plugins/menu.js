@@ -1,3 +1,4 @@
+
 'use strict';
 /**
  * POPKID MENU — vertical box menu, built automatically from the loaded commands.
@@ -5,15 +6,14 @@
  *   .menu             every command, one box per category
  *   .menu <category>  only that category   (e.g. .menu admin, .menu downloads)
  *
- * No links shown. The picture is a LOCAL file (never a URL) shown as a preview card on top.
+ * No links anywhere. The picture (optional) is a LOCAL file, never a URL.
  */
 const fs = require('fs');
 const path = require('path');
 const { cmd } = require('../arslan');
 
-// Show the picture on top of the menu (as a preview card, in the SAME message).
-// Local files only: the picture set with .setmenuimg, or data/menu-default.jpg.
-// Set to false for a text-only menu.
+// Set to true to send a picture banner (header) before the list.
+// Local files only: popkid.jpg, the picture set with .setmenuimg, or data/menu-default.jpg.
 const USE_PICTURE = true;
 
 const MAX_MSG = 20000;  // whole menu in ONE message (WhatsApp allows far more); only split if it ever gets bigger
@@ -156,41 +156,19 @@ function pack(blocks) {
 
 /** local picture only — never a link */
 function localPicture() {
-    const candidates = [global.menuImage, path.join(__dirname, '..', 'data', 'menu-image.jpg'), path.join(__dirname, '..', 'data', 'menu-default.jpg')];
+    const candidates = [
+        global.menuImage,
+        path.join(__dirname, '..', 'popkid.jpg'),
+        path.join(__dirname, '..', 'data', 'menu-image.jpg'),
+        path.join(__dirname, '..', 'data', 'menu-default.jpg')
+    ];
+
     for (const f of candidates) {
         try {
             if (f && !/^https?:\/\//i.test(f) && fs.existsSync(f)) return fs.readFileSync(f);
         } catch { /* try the next one */ }
     }
     return null;
-}
-
-/** the preview card: the local picture shrunk to a small thumbnail */
-let thumbCache = null;
-async function pictureCard() {
-    const img = localPicture();
-    if (!img) return null;
-    if (!thumbCache || thumbCache.src !== img.length) {
-        let out = null;
-        try {
-            out = await require('sharp')(img).resize({ width: 640, withoutEnlargement: true }).jpeg({ quality: 72 }).toBuffer();
-        } catch {
-            out = img.length < 300 * 1024 ? img : null;   // no sharp: use the file as it is if it is small
-        }
-        thumbCache = { src: img.length, buf: out };
-    }
-    if (!thumbCache.buf) return null;
-
-    const num = String(global.ownerNumber || '').replace(/\D/g, '');
-    return {
-        title: (global.botName && global.botName !== 'POPKID') ? global.botName : '𝗣𝗢𝗣𝗞𝗜𝗗-𝗠𝗗',
-        body: `ᴏᴡɴᴇʀ : ${global.ownerName || 'POPKID'}  •  ᴘʀᴇғɪx : [ ${global.BOT_PREFIX || '.'} ]`,
-        thumbnail: thumbCache.buf,
-        sourceUrl: num ? `https://wa.me/${num}` : 'https://wa.me/',   // tapping the card opens a chat with the owner
-        mediaType: 1,
-        renderLargerThumbnail: true,
-        showAdAttribution: false
-    };
 }
 
 /* ───────────── the command ───────────── */
@@ -219,26 +197,23 @@ cmd({
         const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
         const boxes = shown.map(k => categoryBox(k, groups[k]));
 
-        const texts = pack([head, ...boxes]);
-        texts[texts.length - 1] += `\n${footer}`;
-
-        // picture on top: a preview card on the first message (one message, picture + menu)
-        let card = null;
-        if (USE_PICTURE) {
-            try { card = await pictureCard(); } catch (err) { console.error('[MENU] picture error:', err.message); }
-        }
-
-        let first = false;
-        if (card) {
-            try {
-                await sock.sendMessage(m.from, { text: texts[0], contextInfo: { externalAdReply: card } }, { quoted: m.raw || m });
-                first = true;
-            } catch (err) {
-                console.error('[MENU] picture card failed, sending plain text:', err.message);
+        // optional picture banner (header as caption), then the list
+        let blocks = [head, ...boxes];
+        if (USE_PICTURE && !want) {
+            const img = localPicture();
+            if (img) {
+                try {
+                    await m.reply({ image: img, caption: head });
+                    blocks = boxes;
+                } catch (err) {
+                    console.error('[MENU] picture failed, sending text only:', err.message);
+                }
             }
         }
 
-        for (let i = first ? 1 : 0; i < texts.length; i++) {
+        const texts = pack(blocks);
+        texts[texts.length - 1] += `\n${footer}`;
+        for (let i = 0; i < texts.length; i++) {
             if (i) await new Promise(r => setTimeout(r, 400));
             await m.reply(texts[i]);
         }
