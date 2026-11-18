@@ -1,4 +1,3 @@
-
 'use strict';
 /**
  * POPKID MENU — vertical box menu, built automatically from the loaded commands.
@@ -12,11 +11,11 @@ const fs = require('fs');
 const path = require('path');
 const { cmd } = require('../arslan');
 
-// Set to true to send a picture banner (header) before the list.
-// Local files only: popkid.jpg, the picture set with .setmenuimg, or data/menu-default.jpg.
+// true = send a picture banner (header as caption) before the list.
 const USE_PICTURE = true;
-
-const MAX_MSG = 20000;  // whole menu in ONE message (WhatsApp allows far more); only split if it ever gets bigger
+const MAX_IMAGE_BYTES = 800 * 1024; // bigger pictures make the upload hang -> skipped (or shrunk if sharp exists)
+const IMAGE_TIMEOUT_MS = 15000;     // never let a stuck upload block the menu text
+const MAX_MSG = 20000;              // whole menu in ONE message; split only if bigger
 
 /* ───────────── categories ───────────── */
 const CATS = {
@@ -57,6 +56,11 @@ const NATIVE = [
 /* ───────────── small helpers ───────────── */
 const SMALL = { a: 'ᴀ', b: 'ʙ', c: 'ᴄ', d: 'ᴅ', e: 'ᴇ', f: 'ғ', g: 'ɢ', h: 'ʜ', i: 'ɪ', j: 'ᴊ', k: 'ᴋ', l: 'ʟ', m: 'ᴍ', n: 'ɴ', o: 'ᴏ', p: 'ᴘ', q: 'ǫ', r: 'ʀ', s: 's', t: 'ᴛ', u: 'ᴜ', v: 'ᴠ', w: 'ᴡ', x: 'x', y: 'ʏ', z: 'ᴢ' };
 const sc = (s) => String(s).toLowerCase().split('').map(c => SMALL[c] || c).join('');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const withTimeout = (promise, ms) => Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout after ' + ms + 'ms')), ms))
+]);
 
 function clock() {
     const tz = global.timezone || 'Africa/Nairobi';
@@ -72,12 +76,31 @@ function clock() {
     }
 }
 
-const greet = (h) => h >= 5 && h < 12 ? '🌅 Good morning' : h < 17 && h >= 12 ? '☀️ Good afternoon' : h >= 17 && h < 21 ? '🌇 Good evening' : '🌙 Good night';
+const greet = (h) => h >= 5 && h < 12 ? '🌅 Good morning' : h >= 12 && h < 17 ? '☀️ Good afternoon' : h >= 17 && h < 21 ? '🌇 Good evening' : '🌙 Good night';
 
 function uptimeText() {
     const s = Math.floor(process.uptime());
     const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
     return `${d ? d + 'd ' : ''}${h}h ${m}m`;
+}
+
+/** args may be an array, a string, or undefined depending on the framework */
+function normalizeArgs(args) {
+    if (Array.isArray(args)) return args.map(String).filter(Boolean);
+    if (typeof args === 'string') return args.trim().split(/\s+/).filter(Boolean);
+    return [];
+}
+
+/** send text safely: m.reply first, sock.sendMessage as fallback */
+async function sendText(sock, m, text) {
+    try {
+        return await m.reply(text);
+    } catch (err) {
+        console.error('[MENU] m.reply failed, trying sendMessage:', err && err.message);
+        const jid = m.chat || m.from || (m.key && m.key.remoteJid);
+        if (!jid) throw err;
+        return sock.sendMessage(jid, { text }, { quoted: m });
+    }
 }
 
 /* ───────────── read the loaded commands ───────────── */
@@ -92,10 +115,17 @@ function collect() {
     };
 
     let disabled = [];
-    try { disabled = require('../lib/settings').list('disabled'); } catch { /* optional */ }
+    try {
+        const d = require('../lib/settings').list('disabled');
+        if (Array.isArray(d)) disabled = d;
+    } catch { /* optional */ }
 
-    for (const p of (global.plugins instanceof Map ? global.plugins.values() : [])) {
-        if (!p || !p.name || p.hidden || p.name.startsWith('__') || disabled.includes(p.name)) continue;
+    const plugins = global.plugins instanceof Map ? [...global.plugins.values()]
+        : Array.isArray(global.plugins) ? global.plugins
+        : (global.plugins && typeof global.plugins === 'object') ? Object.values(global.plugins) : [];
+
+    for (const p of plugins) {
+        if (!p || typeof p.name !== 'string' || !p.name || p.hidden || p.name.startsWith('__') || disabled.includes(p.name)) continue;
         add(p.name, p.category);
     }
     for (const [name, cat] of NATIVE) if (!disabled.includes(name)) add(name, cat);
@@ -115,7 +145,7 @@ function headerBox(m, total, categories) {
         `╭${LINE}`,
         `║   ✨ *${'𝗣𝗢𝗣𝗞𝗜𝗗-𝗠𝗗'}* ✨`,
         `╠${LINE}`,
-        `║ ${greet(c.hour)}, *${m.pushName || 'User'}*`,
+        `║ ${greet(c.hour)}, *${(m && m.pushName) || 'User'}*`,
         `╠${LINE}`,
         `║ 👑 *${sc('owner')}:* ${global.ownerName || 'POPKID'}`,
         `║ 🚀 *${sc('commands')}:* ${total}`,
@@ -142,11 +172,21 @@ function categoryBox(key, names) {
     ].join('\n');
 }
 
-/** join boxes into messages that stay under the size limit */
+/** join boxes into messages that stay under the size limit (oversized single boxes are split by line) */
 function pack(blocks) {
+    const pieces = [];
+    for (const b of blocks) {
+        if (b.length <= MAX_MSG) { pieces.push(b); continue; }
+        let cur = '';
+        for (const line of b.split('\n')) {
+            if (cur && cur.length + 1 + line.length > MAX_MSG) { pieces.push(cur); cur = line; }
+            else cur = cur ? `${cur}\n${line}` : line;
+        }
+        if (cur) pieces.push(cur);
+    }
     const out = [];
     let cur = '';
-    for (const b of blocks) {
+    for (const b of pieces) {
         if (cur && cur.length + 1 + b.length > MAX_MSG) { out.push(cur); cur = b; }
         else cur = cur ? `${cur}\n${b}` : b;
     }
@@ -154,8 +194,8 @@ function pack(blocks) {
     return out;
 }
 
-/** local picture only — never a link */
-function localPicture() {
+/** local picture only — never a link. Oversized pictures are shrunk with sharp if present, else skipped. */
+async function localPicture() {
     const candidates = [
         global.menuImage,
         path.join(__dirname, '..', 'popkid.jpg'),
@@ -165,7 +205,18 @@ function localPicture() {
 
     for (const f of candidates) {
         try {
-            if (f && !/^https?:\/\//i.test(f) && fs.existsSync(f)) return fs.readFileSync(f);
+            if (!f || typeof f !== 'string' || /^https?:\/\//i.test(f) || !fs.existsSync(f)) continue;
+            let buf = fs.readFileSync(f);
+            if (buf.length > MAX_IMAGE_BYTES) {
+                try {
+                    const sharp = require('sharp');
+                    buf = await sharp(buf).resize({ width: 800, withoutEnlargement: true }).jpeg({ quality: 70 }).toBuffer();
+                } catch {
+                    console.error(`[MENU] ${path.basename(f)} is ${(buf.length / 1024) | 0}KB (> limit) and sharp is not installed — shrink it by hand`);
+                    continue;
+                }
+            }
+            return buf;
         } catch { /* try the next one */ }
     }
     return null;
@@ -182,31 +233,33 @@ cmd({
     filename: __filename
 }, async (sock, m, args) => {
     try {
+        const a = normalizeArgs(args);
         const { groups, keys, total } = collect();
         const p = global.BOT_PREFIX || '.';
 
         // .menu <category>
-        const want = args[0] ? keyOf(args[0]) : null;
+        const want = a[0] ? keyOf(a[0]) : null;
         const shown = want ? keys.filter(k => k === want) : keys;
         if (!shown.length) {
             const list = keys.map(k => (CATS[k] ? CATS[k][1] : k.toUpperCase()).toLowerCase()).join(', ');
-            return m.reply(`❌ No category called *${args[0]}*\n\n📂 ${list}\n\nTry ${p}menu`);
+            return await sendText(sock, m, `❌ No category called *${a[0]}*\n\n📂 ${list}\n\nTry ${p}menu`);
         }
 
         const head = headerBox(m, total, keys.length);
         const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
         const boxes = shown.map(k => categoryBox(k, groups[k]));
 
-        // optional picture banner (header as caption), then the list
+        // optional picture banner (header as caption), then the list.
+        // If the picture fails or times out, the header goes out as plain text instead.
         let blocks = [head, ...boxes];
         if (USE_PICTURE && !want) {
-            const img = localPicture();
+            const img = await localPicture();
             if (img) {
                 try {
-                    await m.reply({ image: img, caption: head });
+                    await withTimeout(Promise.resolve(m.reply({ image: img, caption: head })), IMAGE_TIMEOUT_MS);
                     blocks = boxes;
                 } catch (err) {
-                    console.error('[MENU] picture failed, sending text only:', err.message);
+                    console.error('[MENU] picture failed, sending text only:', err && err.message);
                 }
             }
         }
@@ -214,11 +267,11 @@ cmd({
         const texts = pack(blocks);
         texts[texts.length - 1] += `\n${footer}`;
         for (let i = 0; i < texts.length; i++) {
-            if (i) await new Promise(r => setTimeout(r, 400));
-            await m.reply(texts[i]);
+            if (i) await sleep(400);
+            await sendText(sock, m, texts[i]);
         }
     } catch (err) {
         console.error('[MENU] error:', err);
-        await m.reply('❌ Could not build the menu.').catch(() => {});
+        try { await m.reply('❌ Could not build the menu.'); } catch { /* nothing left to try */ }
     }
 });
