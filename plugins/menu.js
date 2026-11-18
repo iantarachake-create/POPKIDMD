@@ -15,7 +15,7 @@ const { cmd } = require('../arslan');
 // Local files only: the picture set with .setmenuimg, or data/menu-default.jpg.
 const USE_PICTURE = false;
 
-const MAX_MSG = 3800;   // longest single message; the list is split on box edges
+const MAX_MSG = 20000;  // whole menu in ONE message (WhatsApp allows far more); only split if it ever gets bigger
 
 /* ───────────── categories ───────────── */
 const CATS = {
