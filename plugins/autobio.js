@@ -28,12 +28,24 @@ cmd({
         return m.reply(`✅ Autobio timezone set to *${tz}*.`);
     }
 
+    if (action === 'text' || action === 'set') {
+        const txt = args.slice(1).join(' ').trim();
+        if (!txt) return m.reply(`❌ Usage: ${global.BOT_PREFIX}autobio text <message>\nPlaceholders: {uptime} {time} {date} {city}\nExample: ${global.BOT_PREFIX}autobio text POPKID MD is running 🟢 | {time}`);
+        autobio.setCustom(sock, txt);
+        return m.reply(`✅ Autobio text set:\n${autobio.buildBio()}`);
+    }
+
+    if (action === 'reset') {
+        autobio.setCustom(sock, '');
+        return m.reply(`✅ Autobio text reset to default:\n${autobio.buildBio()}`);
+    }
+
     const s = autobio.getSettings();
     return sendBtns(sock, m, {
         title: '𝗣𝗢𝗣𝗞𝗜𝗗 𝗔𝗨𝗧𝗢𝗕𝗜𝗢',
         text: `📊 *STATUS* : ${s.enabled ? '🟢 ON' : '🔴 OFF'}\n🌍 *TIMEZONE* : ${s.timezone}\n\n` +
               `📝 *PREVIEW*\n${autobio.buildBio()}\n\n` +
-              `Change zone: ${global.BOT_PREFIX}autobio tz Africa/Lagos`,
+              `Change zone: ${global.BOT_PREFIX}autobio tz Africa/Lagos\nCustom text: ${global.BOT_PREFIX}autobio text <message>\nDefault text: ${global.BOT_PREFIX}autobio reset`,
         buttons: [
             { text: '🟢 Turn ON', cmd: 'autobio on' },
             { text: '🔴 Turn OFF', cmd: 'autobio off' }
