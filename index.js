@@ -222,68 +222,91 @@ async function resolveStatusParticipant(sock, rawMsg) {
 // -----------------------------------------------------------------------
 // AUTO STATUS (view + react) — modelled on KnightBot's working autostatus flow
 // -----------------------------------------------------------------------
-let statusQueue = Promise.resolve();
 const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+const _statusSeen = new Set();
+const DEFAULT_STATUS_EMOJIS = ["❤️", "🩶", "🔥", "🤍", "♦️", "🎉", "💚", "💯", "✨", "☢️", "😍", "🎊"];
 
+function isStatusKey(key) {
+    return !!key && (key.remoteJid === 'status@broadcast' || key.remoteJidAlt === 'status@broadcast');
+}
+
+// Poster can arrive as participant / participantAlt / remoteJidAlt, sometimes as @lid
+function rawStatusPoster(key) {
+    const cands = [key.participant, key.participantAlt, key.remoteJidAlt].filter(
+        j => j && j !== 'status@broadcast'
+    );
+    return cands.find(j => !j.endsWith('@lid')) || cands[0] || '';
+}
+
+async function resolveStatusPoster(sock, rawMsg) {
+    const raw = rawStatusPoster(rawMsg.key);
+    if (!raw) return '';
+    if (!raw.endsWith('@lid')) {
+        // strip device suffix (:12@s.whatsapp.net -> @s.whatsapp.net)
+        const [u, d] = raw.split('@');
+        return u.split(':')[0] + '@' + d;
+    }
+    try {
+        const r = await resolveStatusParticipant(sock, { ...rawMsg, key: { ...rawMsg.key, participant: raw } });
+        return r || raw;
+    } catch { return raw; }
+}
+
+// View + react to one status. Modelled on Toxic-MD: independent view / react,
+// resolved poster JID, readMessages with raw-key fallback, sendMessage react
+// with statusJidList, no content-type filter, no dropped reactions.
 async function handleAutoStatus(sock, rawMsg) {
-    if (rawMsg.key.fromMe) return;
-    // Diagnostic: proves statuses reach the bot at all (shows in the host logs)
-    console.log(`📨 Status received from ${rawMsg.key.participant} (autoView=${!!global.autoView}, autoLike=${!!global.autoLike})`);
-    if (!global.autoView && !global.autoLike) return;
+    try {
+        if (!rawMsg?.key || rawMsg.key.fromMe) return;
+        if (rawMsg.message?.protocolMessage) return;
+        if (!global.autoView && !global.autoLike) return;
 
-    // Small delay before touching the status (avoids WhatsApp rate limits)
-    await sleepMs(1000);
+        // dedupe (upsert can fire twice for the same status)
+        const sid = rawMsg.key.id || '';
+        if (sid) {
+            if (_statusSeen.has(sid)) return;
+            _statusSeen.add(sid);
+            if (_statusSeen.size > 300) _statusSeen.delete(_statusSeen.values().next().value);
+        }
 
-    if (global.autoView) {
-        try {
-            await sock.readMessages([rawMsg.key]);
-            console.log('👁️ Status marked as viewed');
-        } catch (err) {
-            if (String(err.message).includes('rate-overlimit')) {
-                console.log('⚠️ Rate limit hit, waiting before retrying...');
-                await sleepMs(2000);
-                try { await sock.readMessages([rawMsg.key]); } catch (e2) { console.log('❌ Status viewer error:', e2.message); }
-            } else {
-                console.log('❌ Status viewer error:', err.message);
+        const rawPoster = rawStatusPoster(rawMsg.key);
+        const poster = await resolveStatusPoster(sock, rawMsg);
+        const viewKey = { ...rawMsg.key, remoteJid: 'status@broadcast', ...(poster ? { participant: poster } : {}) };
+
+        if (global.autoView) {
+            try {
+                await sock.readMessages([viewKey]);
+            } catch (err) {
+                try { await sock.readMessages([{ ...rawMsg.key, remoteJid: 'status@broadcast', participant: rawPoster || rawMsg.key.participant }]); }
+                catch (e2) { console.log('❌ Status viewer error:', e2.message); }
             }
         }
-    }
 
-    if (!global.autoLike) return;
-    if (Date.now() - lastStatusReactTime < (global.statusReactThrottleMs ?? 5000)) return; // throttle
+        if (global.autoLike && (poster || rawPoster)) {
+            // small spacing so bursts of statuses don't hit WhatsApp rate limits
+            const wait = Math.max(0, (global.statusReactDelayMs ?? 2000) - (Date.now() - lastStatusReactTime));
+            if (wait) await sleepMs(wait);
+            lastStatusReactTime = Date.now();
 
-    try {
-        // The poster can come as an @lid; reactions need their real JID
-        const realJid = await resolveStatusParticipant(sock, rawMsg);
-        const contentType = getContentType(rawMsg.message);
-        const reactable = ['imageMessage', 'videoMessage', 'extendedTextMessage', 'conversation', 'audioMessage'];
-        if (!reactable.includes(contentType)) return;
-
-        const emojis = (global.statusEmojis && global.statusEmojis.length)
-            ? global.statusEmojis
-            : ["❤️", "🩶", "🔥", "🤍", "♦️", "🎉", "💚", "💯", "✨", "😍", "🎊"];
-        const emoji = emojis[Math.floor(Math.random() * emojis.length)];
-        const botId = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
-
-        // KnightBot's working method: relay a raw reactionMessage to status@broadcast
-        await sock.relayMessage(
-            'status@broadcast',
-            {
-                reactionMessage: {
-                    key: { remoteJid: 'status@broadcast', id: rawMsg.key.id, participant: realJid, fromMe: false },
-                    text: emoji
-                }
-            },
-            {
-                messageId: rawMsg.key.id,
-                statusJidList: [realJid, botId].filter(Boolean)
+            const emojis = (global.statusEmojis && global.statusEmojis.length) ? global.statusEmojis : DEFAULT_STATUS_EMOJIS;
+            const emoji = emojis[Math.floor(Math.random() * emojis.length)];
+            const botId = sock.user?.id ? sock.user.id.split(':')[0] + '@s.whatsapp.net' : null;
+            const target = poster || rawPoster;
+            const reactKey = { ...rawMsg.key, remoteJid: 'status@broadcast', participant: target };
+            try {
+                await sock.sendMessage('status@broadcast',
+                    { react: { text: emoji, key: reactKey } },
+                    { statusJidList: [target, botId].filter(Boolean) });
+            } catch (err) {
+                // fallback: raw reactionMessage relay
+                await sock.relayMessage('status@broadcast',
+                    { reactionMessage: { key: { ...reactKey, fromMe: false }, text: emoji } },
+                    { messageId: rawMsg.key.id, statusJidList: [target, botId].filter(Boolean) });
             }
-        );
-        lastStatusReactTime = Date.now();
-        console.log(`💫 Reacted ${emoji} to status from ${realJid}`);
-        await sleepMs(global.statusReactDelayMs ?? 2000);
+            console.log(`💫 Reacted ${emoji} to status from ${target}`);
+        }
     } catch (err) {
-        console.log('❌ Status like error:', err.message);
+        console.log('❌ Auto status error:', err.message);
     }
 }
 
@@ -853,6 +876,17 @@ function startBot() {
                 console.log('📁 No plugins folder found');
             }
 
+            // Statuses that arrive as updates (Toxic-MD parity): view them too
+            sock.ev.on('messages.update', (updates) => {
+                for (const u of updates || []) {
+                    try {
+                        if (u.key && isStatusKey(u.key) && u.update?.messageStubType === 1) {
+                            handleAutoStatus(sock, { key: u.key }).catch(() => {});
+                        }
+                    } catch {}
+                }
+            });
+
             sock.ev.on('messages.upsert', async ({ messages, type }) => {
                 if (type !== 'notify' && type !== 'append') return;
 
@@ -880,13 +914,10 @@ function startBot() {
                     }
                 }
 
-                // Statuses: handled one at a time in the background (same flow as KnightBot's
-                // autostatus: short delay, view, rate-limit retry, then react) so commands are never delayed.
+                // Statuses: handled in the background (Toxic-MD style) so commands are never delayed.
                 for (const rawMsg of messages) {
-                    if (rawMsg.key?.remoteJid === 'status@broadcast' && rawMsg.key.participant && rawMsg.message) {
-                        statusQueue = statusQueue
-                            .then(() => handleAutoStatus(sock, rawMsg))
-                            .catch(err => console.log('❌ Auto status error:', err.message));
+                    if (isStatusKey(rawMsg.key)) {
+                        handleAutoStatus(sock, rawMsg).catch(err => console.log('❌ Auto status error:', err.message));
                     }
                 }
 
@@ -896,6 +927,7 @@ function startBot() {
 
                 const rawMsg = messages[0];
                 if (!rawMsg.message) return;
+                if (isStatusKey(rawMsg.key)) return; // statuses are fully handled above
 
                 const m = await serializeMessage(sock, rawMsg);
 
