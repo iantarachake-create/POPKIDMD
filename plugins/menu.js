@@ -5,20 +5,18 @@
  *   .menu             every command, one box per category
  *   .menu <category>  only that category   (e.g. .menu admin, .menu downloads)
  *
- * The picture can be a local file path or a URL (e.g. Catbox/Telegraph).
+ * No links anywhere. The picture (optional) is a LOCAL file, never a URL.
  */
 const fs = require('fs');
 const path = require('path');
 const { cmd } = require('../arslan');
 
-// true = send a picture banner (header as caption) before the category list.
-const USE_PICTURE = true;
-const MAX_IMAGE_BYTES = 1024 * 1024; // 1MB limit for local resizing
+// true = send a picture banner (header as caption) before the list (2 messages).
+// false = send everything (header + all categories) in ONE text message.
+const USE_PICTURE = false;
+const MAX_IMAGE_BYTES = 800 * 1024; // bigger pictures make the upload hang -> skipped (or shrunk if sharp exists)
 const IMAGE_TIMEOUT_MS = 15000;     // never let a stuck upload block the menu text
-const MAX_MSG = 60000;              // keep categories packed securely
-
-// Default or fallback image URL (supports the Catbox link you provided)
-const DEFAULT_MENU_IMAGE = 'https://files.catbox.moe/nfpn3e.jpg';
+const MAX_MSG = 60000;              // keep full menu in ONE text message unless massive
 
 /* ───────────── categories ───────────── */
 const CATS = {
@@ -50,7 +48,7 @@ const keyOf = (s) => {
     return SAME[k] || k;
 };
 
-/* Commands answered directly by index.js */
+/* Commands answered directly by index.js (they never call cmd(), so they are listed here). */
 const NATIVE = [
     ['warn', 'admin'], ['resetwarn', 'admin'],
     ['anticall', 'owner'], ['antispam', 'owner'], ['broadcast', 'owner'], ['backup', 'owner'], ['restore', 'owner']
@@ -175,7 +173,7 @@ function categoryBox(key, names) {
     ].join('\n');
 }
 
-/** join boxes into messages that stay under the size limit */
+/** join boxes into messages that stay under the size limit (oversized single boxes are split by line) */
 function pack(blocks) {
     const pieces = [];
     for (const b of blocks) {
@@ -197,38 +195,32 @@ function pack(blocks) {
     return out;
 }
 
-/** Resolves picture from global config, local file path, or remote URL (Catbox) */
-async function getMenuImage() {
+/** local picture only — never a link. Oversized pictures are shrunk with sharp if present, else skipped. */
+async function localPicture() {
     const candidates = [
         global.menuImage,
-        DEFAULT_MENU_IMAGE,
         path.join(__dirname, '..', 'popkid.jpg'),
-        path.join(__dirname, '..', 'data', 'menu-image.jpg')
+        path.join(__dirname, '..', 'data', 'menu-image.jpg'),
+        path.join(__dirname, '..', 'data', 'menu-default.jpg')
     ];
 
     for (const f of candidates) {
         try {
-            if (!f) continue;
-            // If it's a URL (like your catbox link)
-            if (/^https?:\/\//i.test(f)) {
-                return f; 
-            }
-            // If it's a local file path
-            if (typeof f === 'string' && fs.existsSync(f)) {
-                let buf = fs.readFileSync(f);
-                if (buf.length > MAX_IMAGE_BYTES) {
-                    try {
-                        const sharp = require('sharp');
-                        buf = await sharp(buf).resize({ width: 800, withoutEnlargement: true }).jpeg({ quality: 70 }).toBuffer();
-                    } catch {
-                        // ignore sharp error and use buffer
-                    }
+            if (!f || typeof f !== 'string' || /^https?:\/\//i.test(f) || !fs.existsSync(f)) continue;
+            let buf = fs.readFileSync(f);
+            if (buf.length > MAX_IMAGE_BYTES) {
+                try {
+                    const sharp = require('sharp');
+                    buf = await sharp(buf).resize({ width: 800, withoutEnlargement: true }).jpeg({ quality: 70 }).toBuffer();
+                } catch {
+                    console.error(`[MENU] ${path.basename(f)} is ${(buf.length / 1024) | 0}KB (> limit) and sharp is not installed — shrink it by hand`);
+                    continue;
                 }
-                return buf;
             }
-        } catch { /* try next */ }
+            return buf;
+        } catch { /* try the next one */ }
     }
-    return DEFAULT_MENU_IMAGE;
+    return null;
 }
 
 /* ───────────── the command ───────────── */
@@ -255,44 +247,22 @@ cmd({
         }
 
         const head = headerBox(m, total, keys.length);
-        const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏ🇦* 🇰🇪`;
+        const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
         const boxes = shown.map(k => categoryBox(k, groups[k]));
 
-        // If requesting a specific single category, send only categories
-        if (want) {
-            const texts = pack(boxes);
-            texts[texts.length - 1] += `\n${footer}`;
-            for (let i = 0; i < texts.length; i++) {
-                if (i) await sleep(400);
-                await sendText(sock, m, texts[i]);
-            }
-            return;
-        }
-
-        // Full Menu: Send Image + Header caption first, then category boxes underneath
-        if (USE_PICTURE) {
-            const imgSource = await getMenuImage();
-            if (imgSource) {
+        let blocks = [head, ...boxes];
+        if (USE_PICTURE && !want) {
+            const img = await localPicture();
+            if (img) {
                 try {
-                    // Send image with header box as caption
-                    await withTimeout(Promise.resolve(m.reply({ image: typeof imgSource === 'string' ? { url: imgSource } : imgSource, caption: head })), IMAGE_TIMEOUT_MS);
-                    
-                    // Pack and send all category boxes right after
-                    const texts = pack(boxes);
-                    texts[texts.length - 1] += `\n${footer}`;
-                    for (let i = 0; i < texts.length; i++) {
-                        await sleep(400);
-                        await sendText(sock, m, texts[i]);
-                    }
-                    return;
+                    await withTimeout(Promise.resolve(m.reply({ image: img, caption: head })), IMAGE_TIMEOUT_MS);
+                    blocks = boxes;
                 } catch (err) {
-                    console.error('[MENU] image delivery failed, falling back to text:', err && err.message);
+                    console.error('[MENU] picture failed, sending text only:', err && err.message);
                 }
             }
         }
 
-        // Fallback text-only display if picture is disabled or fails
-        const blocks = [head, ...boxes];
         const texts = pack(blocks);
         texts[texts.length - 1] += `\n${footer}`;
         for (let i = 0; i < texts.length; i++) {
@@ -301,6 +271,6 @@ cmd({
         }
     } catch (err) {
         console.error('[MENU] error:', err);
-        try { await m.reply('❌ Could not build the menu.'); } catch { /* nothing left */ }
+        try { await m.reply('❌ Could not build the menu.'); } catch { /* nothing left to try */ }
     }
 });
