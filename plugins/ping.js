@@ -1,18 +1,25 @@
+'use strict';
+
 const { cmd } = require('../arslan');
 
 cmd({
-    pattern: "ping",
+    pattern: 'ping',
     name: 'ping',
+    alias: ['speed', 'latency'],
     category: 'General',
-    aliases: ['p', 'pong'],
-    description: 'Check bot response time',
+    desc: 'Check bot speed',
     filename: __filename
-}, async (sock, m, args) => {
+}, async (sock, m) => {
     const start = Date.now();
-    await m.reply('🏓 Pong!');
-    const latency = Date.now() - start;
+    const sent = await m.reply('⚡ *Pinging...*');
+    const speed = Date.now() - start;
 
-    await sock.sendMessage(m.from, {
-        text: `🏓 Pong! ${latency}ms`
-    }, { quoted: m.raw });
+    const text = `🏓 *Pong!* ${speed}ms`;
+    const jid = m.chat || m.from || (m.key && m.key.remoteJid);
+
+    if (sent && sent.key && jid) {
+        await sock.sendMessage(jid, { text, edit: sent.key });
+    } else {
+        await m.reply(text);
+    }
 });
