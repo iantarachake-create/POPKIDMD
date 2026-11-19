@@ -249,22 +249,34 @@ cmd({
         const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
         const boxes = shown.map(k => categoryBox(k, groups[k]));
 
-        // optional picture banner (header as caption), then the list.
-        // If the picture fails or times out, the header goes out as plain text instead.
-        let blocks = [head, ...boxes];
-        if (USE_PICTURE && !want) {
+        const full = [head, ...boxes].join('\n') + `\n${footer}`;
+
+        // ONE message: the picture is a big banner on top of the menu text (externalAdReply),
+        // so the header + every category arrive together instead of as picture + separate text.
+        // If the picture is missing or the rich card fails, the same full menu goes out as plain text.
+        if (USE_PICTURE && !want && full.length <= MAX_MSG) {
             const img = await localPicture();
             if (img) {
                 try {
-                    await withTimeout(Promise.resolve(m.reply({ image: img, caption: head })), IMAGE_TIMEOUT_MS);
-                    blocks = boxes;
+                    const card = {
+                        title: '𝗣𝗢𝗣𝗞𝗜𝗗-𝗠𝗗',
+                        body: `${total} commands • prefix [ ${p} ]`,
+                        thumbnail: img,
+                        mediaType: 1,
+                        renderLargerThumbnail: true,
+                        showAdAttribution: false
+                    };
+                    if (global.contextLink) card.sourceUrl = global.contextLink;
+                    await withTimeout(Promise.resolve(m.reply({ text: full, contextInfo: { externalAdReply: card } })), IMAGE_TIMEOUT_MS);
+                    return;
                 } catch (err) {
-                    console.error('[MENU] picture failed, sending text only:', err && err.message);
+                    console.error('[MENU] picture card failed, sending text only:', err && err.message);
                 }
             }
         }
 
-        const texts = pack(blocks);
+        // plain text (category menu, no picture, or fallback) — still one message unless it is huge
+        const texts = pack([head, ...boxes]);
         texts[texts.length - 1] += `\n${footer}`;
         for (let i = 0; i < texts.length; i++) {
             if (i) await sleep(400);
