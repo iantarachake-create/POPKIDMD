@@ -11,11 +11,12 @@ const fs = require('fs');
 const path = require('path');
 const { cmd } = require('../arslan');
 
-// true = send a picture banner (header as caption) before the list.
-const USE_PICTURE = true;
+// true = send a picture banner (header as caption) before the list (2 messages).
+// false = send everything (header + all categories) in ONE text message.
+const USE_PICTURE = false;
 const MAX_IMAGE_BYTES = 800 * 1024; // bigger pictures make the upload hang -> skipped (or shrunk if sharp exists)
 const IMAGE_TIMEOUT_MS = 15000;     // never let a stuck upload block the menu text
-const MAX_MSG = 20000;              // whole menu in ONE message; split only if bigger
+const MAX_MSG = 60000;              // keep full menu in ONE text message unless massive
 
 /* ───────────── categories ───────────── */
 const CATS = {
@@ -249,34 +250,20 @@ cmd({
         const footer = `\n💡 ${sc('tip')}: ${p}menu <category>\n\n*© 𝟤𝟢𝟤𝟨 ᴘᴏᴘᴋɪᴅ ᴋᴇɴʏᴀ* 🇰🇪`;
         const boxes = shown.map(k => categoryBox(k, groups[k]));
 
-        const full = [head, ...boxes].join('\n') + `\n${footer}`;
-
-        // ONE message: the picture is a big banner on top of the menu text (externalAdReply),
-        // so the header + every category arrive together instead of as picture + separate text.
-        // If the picture is missing or the rich card fails, the same full menu goes out as plain text.
-        if (USE_PICTURE && !want && full.length <= MAX_MSG) {
+        let blocks = [head, ...boxes];
+        if (USE_PICTURE && !want) {
             const img = await localPicture();
             if (img) {
                 try {
-                    const card = {
-                        title: '𝗣𝗢𝗣𝗞𝗜𝗗-𝗠𝗗',
-                        body: `${total} commands • prefix [ ${p} ]`,
-                        thumbnail: img,
-                        mediaType: 1,
-                        renderLargerThumbnail: true,
-                        showAdAttribution: false
-                    };
-                    if (global.contextLink) card.sourceUrl = global.contextLink;
-                    await withTimeout(Promise.resolve(m.reply({ text: full, contextInfo: { externalAdReply: card } })), IMAGE_TIMEOUT_MS);
-                    return;
+                    await withTimeout(Promise.resolve(m.reply({ image: img, caption: head })), IMAGE_TIMEOUT_MS);
+                    blocks = boxes;
                 } catch (err) {
-                    console.error('[MENU] picture card failed, sending text only:', err && err.message);
+                    console.error('[MENU] picture failed, sending text only:', err && err.message);
                 }
             }
         }
 
-        // plain text (category menu, no picture, or fallback) — still one message unless it is huge
-        const texts = pack([head, ...boxes]);
+        const texts = pack(blocks);
         texts[texts.length - 1] += `\n${footer}`;
         for (let i = 0; i < texts.length; i++) {
             if (i) await sleep(400);
